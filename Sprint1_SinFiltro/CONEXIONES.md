@@ -41,20 +41,31 @@
 │   │    ESP32-S3                 │   │
 │   │    (NO tiene DAC)           │   │
 │   │                             │   │
+│   │  GPIO 8  ◄────┐ I2C        │   │
+│   │  GPIO 10 ◄────┘            │   │
 │   │  GPIO 12 ────►│            │   │
 │   │  GPIO 13 ────►│            │   │
 │   │  GPIO 48 ────►│ LED        │   │
 │   │  5V (ext)────►│            │   │
 │   │  GND     ────►│            │   │
-│   └─────┬──────┬──────────────┘   │
-│         │      │                   │
-│         │      │                   │
-│   ┌─────▼──┐ ┌─▼─────┐            │
-│   │ Servo1 │ │ Servo2 │            │
+│   └─────┬──────┬──────┬─────────┘   │
+│         │      │      │             │
+│   ┌─────▼──┐ ┌─▼─────┐│            │
+│   │ Servo1 │ │ Servo2 ││            │
 │   │ (Base) │ │(Extremo)│           │
-│   │        │ │        │            │
-│   │ MG90S  │ │ MG90S  │            │
-│   └────────┘ └────────┘            │
+│   │        │ │        ││            │
+│   │ MG90S  │ │ MG90S  ││            │
+│   └────────┘ └────────┘│            │
+│                        │             │
+│                  ┌─────▼─────────┐   │
+│                  │   MPU6050     │   │
+│                  │   (Feedback)  │   │
+│                  │               │   │
+│                  │  SDA ─────────┤   │
+│                  │  SCL ─────────┤   │
+│                  │  VCC ── 3.3V  │   │
+│                  │  GND ── GND   │   │
+│                  └───────────────┘   │
 │                                     │
 │   Fuente 5V/2A externa              │
 └─────────────────────────────────────┘
@@ -96,8 +107,8 @@ DAC Out  │ [26] (no usado)        │ ✅ DAC2
 USB D-   │ [19]  ⚠️ NO USAR       │
 USB D+   │ [20]  ⚠️ NO USAR       │
          │                        │
-I2C SDA  │ [8]  (opcional IMU)    │
-I2C SCL  │ [10] ⚠️ NO GPIO 9      │
+I2C SDA  │ [8]  ◄── MPU6050 SDA   │ ✅ Feedback
+I2C SCL  │ [10] ◄── MPU6050 SCL   │ ⚠️ NO GPIO 9
          │                        │
 Servo1   │ [12] ──► Servo Base    │
 Servo2   │ [13] ──► Servo Extremo │
@@ -127,10 +138,10 @@ Vista Superior del Servo MG90S:
 │  [Marrón]       │ ◄── GND (común)
 └─────────────────┘
 
-Conexión:
+Conexión en ESP32-S3 (Brazo):
   Servo1          Servo2
   ------          ------
-Naranja → GPIO13  GPIO12
+Naranja → GPIO12  GPIO13
 Rojo    → +5V     +5V   (fuente externa)
 Marrón  → GND     GND   (común)
 ```
@@ -140,19 +151,40 @@ Marrón  → GND     GND   (común)
 ## 🔌 Conexión MPU6050
 
 ```
-Vista Superior MPU6050:
+Vista Superior MPU6050 (en el Guante):
 ┌─────────────────┐
 │   MPU6050       │
 │                 │
 │ [VCC] ──► 3.3V  │
 │ [GND] ──► GND   │
-│ [SCL] ──► GPIO9 │
-│ [SDA] ──► GPIO8 │
+│ [SCL] ──► GPIO22│ ESP32 WROOM
+│ [SDA] ──► GPIO21│ ESP32 WROOM
 │ [XDA]           │ (no conectar)
 │ [XCL]           │ (no conectar)
 │ [AD0]           │ (no conectar)
 │ [INT]           │ (no conectar)
 └─────────────────┘
+
+Vista Superior MPU6050 (en el Brazo):
+┌─────────────────┐
+│   MPU6050       │
+│   (Feedback)    │
+│                 │
+│ [VCC] ──► 3.3V  │
+│ [GND] ──► GND   │
+│ [SCL] ──► GPIO10│ ESP32-S3 ⚠️ NO GPIO9
+│ [SDA] ──► GPIO8 │ ESP32-S3
+│ [XDA]           │ (no conectar)
+│ [XCL]           │ (no conectar)
+│ [AD0]           │ (no conectar)
+│ [INT]           │ (no conectar)
+└─────────────────┘
+
+⚠️ NOTA IMPORTANTE sobre MPU6050:
+- Algunos módulos clones NO funcionan correctamente
+- Si tienes dos MPU6050, prueba ambos
+- El sistema funciona sin MPU en el brazo (solo sin feedback)
+- MPU en el guante es OBLIGATORIO
 ```
 
 ---
@@ -268,28 +300,31 @@ Posición de la Mano:
 
 ```
 1. CAPTURA (50 Hz)
-   MPU6050 → ESP32-S3
+   MPU6050 → ESP32 WROOM (Guante)
    ↓
    - Leer acelerómetro
    - Leer giroscopio
    - Calcular handPosition
 
 2. TRANSMISIÓN
-   ESP32-S3 → ESP-NOW → Broadcast
+   ESP32 WROOM → ESP-NOW → Broadcast
    ↓
    Paquete de datos (36 bytes)
+   + Salida DAC (GPIO25)
 
 3. RECEPCIÓN
-   ESP32 WROOM ← ESP-NOW
+   ESP32-S3 (Brazo) ← ESP-NOW
    ↓
    - Callback OnDataRecv()
    - Actualizar variables
+   - Leer MPU6050 local (feedback)
 
 4. CONTROL
    ↓
    - Mapear accelX → ángulo
    - Seleccionar servo activo
    - Escribir PWM
+   - Comparar con posición real (MPU brazo)
 
 5. ACTUACIÓN
    ↓

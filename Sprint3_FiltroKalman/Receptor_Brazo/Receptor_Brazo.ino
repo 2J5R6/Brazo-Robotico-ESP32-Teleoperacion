@@ -1,9 +1,12 @@
 /*
- * SPRINT 1 - RECEPTOR (ESP32-S3 en Brazo Robótico)
- * VERSIÓN SIMPLIFICADA - Basada en Test_Serial_ESP32S3 que SÍ funciona
+ * SPRINT 3 - RECEPTOR (ESP32-S3 en Brazo Robótico)
+ * CON FILTRO DE KALMAN + FEEDBACK MPU
  * 
- * Hardware: ESP32-S3 + 2 Servos + MPU6500 (opcional)
- * Comunicación: ESP-NOW broadcast
+ * Mejoras vs Sprint 2:
+ * - Recibe datos filtrados con Kalman
+ * - Usa MPU del brazo para FUSIÓN DE SENSORES
+ * - Compara posición deseada vs posición real
+ * - Control más preciso y estable
  */
 
 #include <esp_now.h>
@@ -17,7 +20,6 @@
 #define SERVO1_PIN 6
 #define SERVO2_PIN 7
 #define LED_PIN 48
-
 #define SDA_PIN 8
 #define SCL_PIN 10
 
@@ -36,7 +38,7 @@ typedef struct struct_message {
   float gyroY;
   float gyroZ;
   unsigned long timestamp;
-  uint8_t handPosition;  // 0=abajo (servo1), 1=arriba (servo2)
+  uint8_t handPosition;
 } struct_message;
 
 struct_message receivedData;
@@ -53,6 +55,36 @@ const float ACCEL_MAX = 4.0;
 const int SERVO_MIN = 0;
 const int SERVO_MAX = 180;
 
+// Variables para feedback del MPU local
+float brazoAccelX = 0;
+float brazoAccelY = 0;
+float brazoAccelZ = 0;
+
+// ========== FILTRO DE KALMAN LOCAL ==========
+class KalmanFilter {
+  private:
+    float Q, R, P, K, X;
+    
+  public:
+    KalmanFilter(float process_noise, float measurement_noise, float estimation_error, float initial_value) {
+      Q = process_noise;
+      R = measurement_noise;
+      P = estimation_error;
+      X = initial_value;
+    }
+    
+    float update(float measurement) {
+      P = P + Q;
+      K = P / (P + R);
+      X = X + K * (measurement - X);
+      P = (1 - K) * P;
+      return X;
+    }
+};
+
+// Kalman para posición real del brazo
+KalmanFilter kalmanBrazo(0.005, 0.05, 1.0, 0.0);
+
 // ========== CALLBACK ESP-NOW ==========
 void OnDataRecv(const esp_now_recv_info_t *recv_info, const uint8_t *incomingData, int len) {
   memcpy(&receivedData, incomingData, sizeof(receivedData));
@@ -60,23 +92,36 @@ void OnDataRecv(const esp_now_recv_info_t *recv_info, const uint8_t *incomingDat
   activeServo = receivedData.handPosition;
   digitalWrite(LED_PIN, HIGH);
   
+  // Los datos YA VIENEN FILTRADOS con Kalman del transmisor
   // Mapear accel de -10 a +10 m/s² a 0-180°
-  // Multiplicamos por 10 para obtener enteros y facilitar el map()
   int targetAngle = map((int)(receivedData.accelX * 10), -100, 100, SERVO_MIN, SERVO_MAX);
   targetAngle = constrain(targetAngle, SERVO_MIN, SERVO_MAX);
   
-  // Suavizado simple: mover hacia el objetivo gradualmente (reduce temblor)
-  int currentPos = (activeServo == 0) ? servo1Position : servo2Position;
-  int diff = targetAngle - currentPos;
+  // Si tenemos MPU del brazo, usar feedback para corrección
+  int correctedAngle = targetAngle;
+  if (mpuBrazoReady) {
+    // Calcular error entre objetivo y posición real
+    float realAccel = kalmanBrazo.update(brazoAccelX);
+    int realAngle = map((int)(realAccel * 10), -100, 100, SERVO_MIN, SERVO_MAX);
+    
+    // Corrección proporcional (pequeña)
+    int error = targetAngle - realAngle;
+    correctedAngle = targetAngle + (error / 4);  // Corrección suave
+    correctedAngle = constrain(correctedAngle, SERVO_MIN, SERVO_MAX);
+  }
   
-  // Si la diferencia es grande, mover rápido. Si es pequeña, mover lento
-  int step = (abs(diff) > 10) ? 5 : 1;
+  // Suavizado de movimiento
+  int currentPos = (activeServo == 0) ? servo1Position : servo2Position;
+  int diff = correctedAngle - currentPos;
+  
+  // Movimiento más agresivo con Kalman (datos más estables)
+  int step = (abs(diff) > 20) ? 10 : 3;
   int newPos = currentPos;
   
   if (diff > 0) {
-    newPos = min(currentPos + step, targetAngle);
+    newPos = min(currentPos + step, correctedAngle);
   } else if (diff < 0) {
-    newPos = max(currentPos - step, targetAngle);
+    newPos = max(currentPos - step, correctedAngle);
   }
   
   // Aplicar posición al servo activo
@@ -92,29 +137,33 @@ void OnDataRecv(const esp_now_recv_info_t *recv_info, const uint8_t *incomingDat
   static int debugCounter = 0;
   if (debugCounter++ >= 20) {
     debugCounter = 0;
-    Serial.print("✓ RX | AccelX:");
+    Serial.print("✓ RX KALMAN | Guante:");
     Serial.print(receivedData.accelX, 2);
     Serial.print(" | Target:");
     Serial.print(targetAngle);
-    Serial.print("° | Actual:");
+    Serial.print("°");
+    if (mpuBrazoReady) {
+      Serial.print(" | Brazo:");
+      Serial.print(brazoAccelX, 2);
+      Serial.print(" | Correg:");
+      Serial.print(correctedAngle);
+      Serial.print("°");
+    }
+    Serial.print(" | Real:");
     Serial.print(newPos);
-    Serial.print("° | Mano:");
-    Serial.print(activeServo == 0 ? "ABAJO" : "ARRIBA");
-    Serial.print(" | Servo");
+    Serial.print("° | S");
     Serial.println(activeServo + 1);
   }
 }
 
 // ========== SETUP ==========
 void setup() {
-  // ===== EXACTAMENTE como Test_Serial_ESP32S3.ino =====
   Serial.begin(115200);
-  delay(3000);  // Esperar 3 segundos
+  delay(3000);
   
-  // Configurar LED
   pinMode(LED_PIN, OUTPUT);
   
-  // Parpadeo inicial - CONFIRMACIÓN VISUAL
+  // Parpadeo inicial
   for(int i = 0; i < 10; i++) {
     digitalWrite(LED_PIN, HIGH);
     delay(100);
@@ -122,24 +171,23 @@ void setup() {
     delay(100);
   }
   
-  // ===== AHORA SÍ, MENSAJES =====
   Serial.println();
   Serial.println("========================================");
-  Serial.println("   RECEPTOR ESP32-S3");
-  Serial.println("   Sprint 1 - Brazo Robotico");
+  Serial.println("   SPRINT 3 - RECEPTOR");
+  Serial.println("   CON FILTRO DE KALMAN + FEEDBACK");
   Serial.println("========================================");
   Serial.println();
   Serial.println("LED parpadeó 10 veces - Sistema arrancando...");
   Serial.println();
   
-  // ===== WiFi SIN consultar MAC =====
+  // WiFi
   Serial.print("[1/5] WiFi... ");
   WiFi.mode(WIFI_STA);
   WiFi.disconnect();
   delay(100);
   Serial.println("OK");
   
-  // ===== Servos =====
+  // Servos
   Serial.print("[2/5] Servos... ");
   ESP32PWM::allocateTimer(0);
   ESP32PWM::allocateTimer(1);
@@ -165,7 +213,7 @@ void setup() {
   servo2.write(90);
   Serial.println("OK (movieron)");
   
-  // ===== ESP-NOW =====
+  // ESP-NOW
   Serial.print("[3/5] ESP-NOW... ");
   if (esp_now_init() != ESP_OK) {
     Serial.println("ERROR!");
@@ -177,8 +225,8 @@ void setup() {
   esp_now_register_recv_cb(OnDataRecv);
   Serial.println("OK");
   
-  // ===== MPU6500 (OPCIONAL - solo para feedback) =====
-  Serial.print("[4/5] MPU6500 Brazo (opcional)... ");
+  // MPU6500 (IMPORTANTE para Sprint 3)
+  Serial.print("[4/5] MPU6500 Brazo (FEEDBACK)... ");
   Wire.begin(SDA_PIN, SCL_PIN);
   Wire.setClock(100000);
   delay(100);
@@ -187,20 +235,31 @@ void setup() {
     mpuBrazo.setAccelerometerRange(MPU6050_RANGE_8_G);
     mpuBrazo.setGyroRange(MPU6050_RANGE_500_DEG);
     mpuBrazo.setFilterBandwidth(MPU6050_BAND_21_HZ);
-    Serial.println("OK (feedback activo)");
+    Serial.println("OK ✓ (fusión activa)");
+    
+    // Calibración inicial
+    Serial.print("    Calibrando Kalman local... ");
+    for(int i = 0; i < 30; i++) {
+      sensors_event_t accel, gyro, temp;
+      mpuBrazo.getEvent(&accel, &gyro, &temp);
+      kalmanBrazo.update(accel.acceleration.x);
+      delay(10);
+    }
+    Serial.println("OK");
   } else {
     mpuBrazoReady = false;
-    Serial.println("NO DETECTADO (sistema funciona igual)");
+    Serial.println("NO DETECTADO (funciona sin feedback)");
   }
   
-  // ===== Listo =====
-  Serial.println("[5/5] Inicializacion completa");
+  // Listo
+  Serial.println("[5/5] Inicialización completa");
   Serial.println();
   Serial.println("========================================");
-  Serial.println("   SISTEMA LISTO");
+  Serial.println("   SISTEMA LISTO - KALMAN + FEEDBACK");
   Serial.println("========================================");
-  Serial.println("Los servos se mueven con datos del GUANTE");
-  Serial.println("MPU local: " + String(mpuBrazoReady ? "ACTIVO" : "DESACTIVADO"));
+  Serial.println("Filtro Kalman: GUANTE + BRAZO");
+  Serial.println("MPU local: " + String(mpuBrazoReady ? "ACTIVO (fusión)" : "DESACTIVADO"));
+  Serial.println("Precisión: MÁXIMA");
   Serial.println("Esperando datos del Transmisor...");
   Serial.println();
   
@@ -216,14 +275,28 @@ void setup() {
 // ========== LOOP ==========
 void loop() {
   static unsigned long lastPrint = 0;
+  static unsigned long lastFeedback = 0;
   static int counter = 0;
   
-  // Apagar LED (se enciende en callback)
+  // Leer MPU del brazo continuamente (si existe)
+  if (mpuBrazoReady) {
+    static unsigned long lastMpuRead = 0;
+    if (millis() - lastMpuRead >= 20) {  // 50Hz
+      lastMpuRead = millis();
+      sensors_event_t accel, gyro, temp;
+      mpuBrazo.getEvent(&accel, &gyro, &temp);
+      brazoAccelX = accel.acceleration.x;
+      brazoAccelY = accel.acceleration.y;
+      brazoAccelZ = accel.acceleration.z;
+    }
+  }
+  
+  // Apagar LED
   if (millis() - lastReceiveTime > 50) {
     digitalWrite(LED_PIN, LOW);
   }
   
-  // Si NO hay datos, imprimir contador cada 1 segundo
+  // Contador si no hay datos
   if (millis() - lastPrint >= 1000) {
     lastPrint = millis();
     
@@ -234,7 +307,31 @@ void loop() {
     }
   }
   
-  // Timeout - volver a centro gradualmente
+  // Feedback detallado cada 3 segundos
+  if (mpuBrazoReady && (millis() - lastFeedback >= 3000)) {
+    lastFeedback = millis();
+    
+    Serial.println("\n╔════════════════════════════════════╗");
+    Serial.println("║  REPORTE FUSIÓN DE SENSORES       ║");
+    Serial.println("╠════════════════════════════════════╣");
+    Serial.print("║ Guante AccelX: ");
+    Serial.print(receivedData.accelX, 2);
+    Serial.println(" m/s²          ║");
+    Serial.print("║ Brazo  AccelX: ");
+    Serial.print(brazoAccelX, 2);
+    Serial.println(" m/s²          ║");
+    Serial.print("║ Servo1: ");
+    Serial.print(servo1Position);
+    Serial.print("° | Servo2: ");
+    Serial.print(servo2Position);
+    Serial.println("°        ║");
+    Serial.print("║ Activo: Servo");
+    Serial.print(activeServo + 1);
+    Serial.println("                    ║");
+    Serial.println("╚════════════════════════════════════╝\n");
+  }
+  
+  // Timeout - volver a centro
   if (lastReceiveTime > 0 && (millis() - lastReceiveTime > TIMEOUT)) {
     if (servo1Position != 90) {
       servo1Position += (servo1Position < 90) ? 1 : -1;

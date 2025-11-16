@@ -1,20 +1,16 @@
 /*
- * SPRINT 1 - TRANSMISOR (ESP32 WROOM en Guante)
- * Sistema de Tele-operación Brazo Robótico 2DOF
+ * SPRINT 3 - TRANSMISOR (ESP32 WROOM en Guante)
+ * CON FILTRO DE KALMAN
  * 
- * Este código:
- * 1. Lee datos de la IMU MPU6050 (acelerómetro y giroscopio)
- * 2. Envía datos por ESP-NOW en modo broadcast
- * 3. Genera señal analógica por DAC para análisis de ruido
+ * Mejoras vs Sprint 2:
+ * - Filtro de Kalman para filtrado óptimo
+ * - Estimación precisa del estado
+ * - Reducción máxima de ruido
  * 
  * HARDWARE:
- * - ESP32 WROOM (tiene DAC para salida analógica)
+ * - ESP32 WROOM (tiene DAC)
  * - MPU6050 (I2C: SDA=GPIO21, SCL=GPIO22)
- * - DAC Output: GPIO25 (DAC1 en ESP32 WROOM)
- * 
- * NOTA IMPORTANTE:
- * ✅ ESP32 WROOM tiene DAC (GPIO25 y GPIO26)
- * ✅ ESP32-S3 NO tiene DAC (por eso NO va en el guante)
+ * - DAC Output: GPIO25
  */
 
 #include <esp_now.h>
@@ -24,16 +20,16 @@
 #include <Adafruit_Sensor.h>
 #include <driver/dac.h>
 
-// ========== CONFIGURACIÓN DE PINES ==========
-#define SDA_PIN 4    // I2C SDA (estándar ESP32)
-#define SCL_PIN 5    // I2C SCL (estándar ESP32)
-#define DAC_PIN 25    // DAC1 para salida analógica (GPIO25 en ESP32 WROOM)
-#define LED_PIN 2     // LED integrado ESP32 WROOM
+// ========== CONFIGURACIÓN ==========
+#define SDA_PIN 21
+#define SCL_PIN 22
+#define DAC_PIN 25
+#define LED_PIN 2
 
-// ========== VARIABLES GLOBALES ==========
+// ========== OBJETOS ==========
 Adafruit_MPU6050 mpu;
 
-// Estructura de datos para enviar por ESP-NOW
+// ========== ESTRUCTURA DE DATOS ==========
 typedef struct struct_message {
   float accelX;
   float accelY;
@@ -42,23 +38,65 @@ typedef struct struct_message {
   float gyroY;
   float gyroZ;
   unsigned long timestamp;
-  uint8_t handPosition;  // 0=abajo, 1=arriba (para seleccionar servo)
+  uint8_t handPosition;
 } struct_message;
 
 struct_message dataToSend;
 
-// Dirección broadcast (todos los dispositivos)
 uint8_t broadcastAddress[] = {0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF};
 
-// Variables de control
+// ========== FILTRO DE KALMAN ==========
+class KalmanFilter {
+  private:
+    float Q;  // Varianza del proceso
+    float R;  // Varianza de la medición
+    float P;  // Covarianza del error de estimación
+    float K;  // Ganancia de Kalman
+    float X;  // Estado estimado
+    
+  public:
+    KalmanFilter(float process_noise, float measurement_noise, float estimation_error, float initial_value) {
+      Q = process_noise;
+      R = measurement_noise;
+      P = estimation_error;
+      X = initial_value;
+    }
+    
+    float update(float measurement) {
+      // Predicción
+      P = P + Q;
+      
+      // Actualización
+      K = P / (P + R);
+      X = X + K * (measurement - X);
+      P = (1 - K) * P;
+      
+      return X;
+    }
+    
+    void reset(float value) {
+      X = value;
+      P = 1.0;
+    }
+    
+    float getState() {
+      return X;
+    }
+};
+
+// Filtros Kalman para cada eje
+// Parámetros: Q (ruido proceso), R (ruido medición), P (error inicial), X0 (valor inicial)
+KalmanFilter kalmanX(0.01, 0.1, 1.0, 0.0);
+KalmanFilter kalmanY(0.01, 0.1, 1.0, 0.0);
+KalmanFilter kalmanZ(0.01, 0.1, 1.0, 9.8);
+
+// ========== VARIABLES ==========
 unsigned long lastSendTime = 0;
-const unsigned long SEND_INTERVAL = 20;  // 50Hz (20ms) - Frecuencia de muestreo
+const unsigned long SEND_INTERVAL = 20;  // 50Hz
 bool mpuReady = false;
 
 // ========== CALLBACK ESP-NOW ==========
-// Callback actualizado para ESP32 Arduino Core v3.x
 void OnDataSent(const wifi_tx_info_t *tx_info, esp_now_send_status_t status) {
-  // Opcional: LED parpadea si envío exitoso
   if (status == ESP_NOW_SEND_SUCCESS) {
     digitalWrite(LED_PIN, !digitalRead(LED_PIN));
   }
@@ -66,35 +104,29 @@ void OnDataSent(const wifi_tx_info_t *tx_info, esp_now_send_status_t status) {
 
 // ========== SETUP ==========
 void setup() {
-  // Inicializar Serial
   Serial.begin(115200);
   delay(1000);
   Serial.println("\n\n=========================================");
-  Serial.println("   SPRINT 1 - TRANSMISOR (Guante)");
-  Serial.println("   ESP32 WROOM + MPU6050 + DAC");
+  Serial.println("   SPRINT 3 - TRANSMISOR (Guante)");
+  Serial.println("   CON FILTRO DE KALMAN");
   Serial.println("=========================================\n");
   
-  // Configurar LED
   pinMode(LED_PIN, OUTPUT);
   digitalWrite(LED_PIN, LOW);
   
-  // Configurar DAC para salida analógica
-  dac_output_enable(DAC_CHANNEL_1);  // GPIO25
+  // DAC
+  dac_output_enable(DAC_CHANNEL_1);
   Serial.println("✓ DAC configurado en GPIO25");
   
-  // Inicializar I2C
+  // I2C
   Wire.begin(SDA_PIN, SCL_PIN);
-  Wire.setClock(100000);  // 100kHz
-  Serial.print("✓ I2C GPIO");
-  Serial.print(SDA_PIN);
-  Serial.print("/");
-  Serial.println(SCL_PIN);
+  Wire.setClock(100000);
+  Serial.println("✓ I2C GPIO21/22");
   
-  // Inicializar MPU6050
+  // MPU6050
   Serial.print("✓ Iniciando MPU6050... ");
   if (!mpu.begin()) {
     Serial.println("FALLO");
-    Serial.println("  ⚠️ Verifica conexiones y reinicia");
     while(1) {
       digitalWrite(LED_PIN, !digitalRead(LED_PIN));
       delay(200);
@@ -102,20 +134,29 @@ void setup() {
   }
   Serial.println("OK");
   
-  // Configurar rangos del MPU6050
   mpu.setAccelerometerRange(MPU6050_RANGE_8_G);
   mpu.setGyroRange(MPU6050_RANGE_500_DEG);
   mpu.setFilterBandwidth(MPU6050_BAND_21_HZ);
-  
   Serial.println("✓ MPU6050 configurado (±8G, ±500°/s, 21Hz)");
+  
+  // Calibración inicial del filtro Kalman
+  Serial.print("✓ Calibrando Filtro de Kalman... ");
+  sensors_event_t accel, gyro, temp;
+  for(int i = 0; i < 50; i++) {
+    mpu.getEvent(&accel, &gyro, &temp);
+    kalmanX.update(accel.acceleration.x);
+    kalmanY.update(accel.acceleration.y);
+    kalmanZ.update(accel.acceleration.z);
+    delay(10);
+  }
+  Serial.println("OK (50 muestras)");
   mpuReady = true;
   
-  // Configurar WiFi en modo estación
+  // WiFi
   WiFi.mode(WIFI_STA);
   WiFi.disconnect();
-  delay(100);  // Dar tiempo a WiFi para inicializar
+  delay(100);
   
-  // ===== MOSTRAR MAC ADDRESS =====
   Serial.println("\n╔════════════════════════════════════╗");
   Serial.println("║  MAC Transmisor (Guante)          ║");
   Serial.println("╠════════════════════════════════════╣");
@@ -124,36 +165,32 @@ void setup() {
   Serial.println("          ║");
   Serial.println("╚════════════════════════════════════╝\n");
   
-  // Inicializar ESP-NOW
+  // ESP-NOW
   if (esp_now_init() != ESP_OK) {
-    Serial.println("✗ ERROR: Fallo al inicializar ESP-NOW");
+    Serial.println("✗ ERROR: ESP-NOW init");
     return;
   }
-  
   Serial.println("✓ ESP-NOW inicializado");
   
-  // Registrar callback de envío
   esp_now_register_send_cb(OnDataSent);
   
-  // Registrar peer (broadcast)
   esp_now_peer_info_t peerInfo = {};
   memcpy(peerInfo.peer_addr, broadcastAddress, 6);
   peerInfo.channel = 0;
   peerInfo.encrypt = false;
-  peerInfo.ifidx = WIFI_IF_STA;  // ← Especificar interfaz WiFi Station
+  peerInfo.ifidx = WIFI_IF_STA;
   
   if (esp_now_add_peer(&peerInfo) != ESP_OK) {
-    Serial.println("✗ ERROR: Fallo al agregar peer");
+    Serial.println("✗ ERROR: Peer add");
     return;
   }
-  
   Serial.println("✓ Peer broadcast agregado");
   
   Serial.println("\n=========================================");
-  Serial.println("   SISTEMA LISTO");
+  Serial.println("   SISTEMA LISTO - KALMAN ACTIVO");
   Serial.println("=========================================");
-  Serial.print("Frecuencia: 50Hz | DAC: GPIO25");
-  Serial.println("\nTransmitiendo datos...\n");
+  Serial.println("Frecuencia: 50Hz | Filtro: Kalman (Q=0.01, R=0.1)");
+  Serial.println("Transmitiendo datos filtrados...\n");
   
   digitalWrite(LED_PIN, HIGH);
   delay(500);
@@ -162,7 +199,6 @@ void setup() {
 
 // ========== LOOP ==========
 void loop() {
-  // Verificar si es tiempo de enviar
   if (millis() - lastSendTime >= SEND_INTERVAL && mpuReady) {
     lastSendTime = millis();
     
@@ -170,50 +206,51 @@ void loop() {
     sensors_event_t accel, gyro, temp;
     mpu.getEvent(&accel, &gyro, &temp);
     
-    // Llenar estructura de datos
-    dataToSend.accelX = accel.acceleration.x;
-    dataToSend.accelY = accel.acceleration.y;
-    dataToSend.accelZ = accel.acceleration.z;
+    // APLICAR FILTRO DE KALMAN
+    float filteredX = kalmanX.update(accel.acceleration.x);
+    float filteredY = kalmanY.update(accel.acceleration.y);
+    float filteredZ = kalmanZ.update(accel.acceleration.z);
+    
+    // Llenar estructura con datos FILTRADOS
+    dataToSend.accelX = filteredX;
+    dataToSend.accelY = filteredY;
+    dataToSend.accelZ = filteredZ;
     dataToSend.gyroX = gyro.gyro.x;
     dataToSend.gyroY = gyro.gyro.y;
     dataToSend.gyroZ = gyro.gyro.z;
     dataToSend.timestamp = millis();
     
-    // Determinar posición de la mano (arriba/abajo) según aceleración Z
-    // Si Z > 8 m/s² → mano arriba (normal, apuntando al cielo)
-    // Si Z < 2 m/s² → mano abajo
+    // Determinar posición de la mano
     if (dataToSend.accelZ > 8.0) {
-      dataToSend.handPosition = 1;  // Arriba - Controla servo2 (extremo)
+      dataToSend.handPosition = 1;  // Arriba
     } else if (dataToSend.accelZ < 2.0) {
-      dataToSend.handPosition = 0;  // Abajo - Controla servo1 (base)
+      dataToSend.handPosition = 0;  // Abajo
     }
-    // Si está entre 2 y 8, mantiene el último estado
     
-    // Enviar datos por ESP-NOW
+    // Enviar por ESP-NOW
     esp_err_t result = esp_now_send(broadcastAddress, (uint8_t *)&dataToSend, sizeof(dataToSend));
     
-    // Generar señal DAC para análisis (usar aceleración X escalada)
-    // Escalar de -8G..+8G a 0..255 para DAC
+    // DAC con datos FILTRADOS por Kalman
     int dacValue = map(dataToSend.accelX * 100, -800, 800, 0, 255);
     dacValue = constrain(dacValue, 0, 255);
     dac_output_voltage(DAC_CHANNEL_1, dacValue);
     
-    // Debug por serial (cada 25 envíos = cada 0.5s aprox)
+    // Debug (cada 25 envíos = 0.5s)
     static int debugCounter = 0;
     if (debugCounter++ >= 25) {
       debugCounter = 0;
-      Serial.print("Accel X:");
-      Serial.print(dataToSend.accelX, 1);
-      Serial.print(" Y:");
-      Serial.print(dataToSend.accelY, 1);
+      Serial.print("AccelX(RAW):");
+      Serial.print(accel.acceleration.x, 2);
+      Serial.print(" → KALMAN:");
+      Serial.print(filteredX, 2);
+      Serial.print(" | Y:");
+      Serial.print(filteredY, 1);
       Serial.print(" Z:");
-      Serial.print(dataToSend.accelZ, 1);
+      Serial.print(filteredZ, 1);
       Serial.print(" | Mano:");
       Serial.print(dataToSend.handPosition == 1 ? "↑" : "↓");
       Serial.print(" | ");
       Serial.println(result == ESP_OK ? "✓" : "✗");
     }
   }
-  
-  delay(1);  // Pequeño delay
 }

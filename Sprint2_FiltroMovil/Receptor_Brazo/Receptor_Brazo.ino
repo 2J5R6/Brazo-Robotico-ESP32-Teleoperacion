@@ -1,9 +1,12 @@
 /*
- * SPRINT 1 - RECEPTOR (ESP32-S3 en Brazo Robótico)
- * VERSIÓN SIMPLIFICADA - Basada en Test_Serial_ESP32S3 que SÍ funciona
+ * SPRINT 2 - RECEPTOR (ESP32-S3 en Brazo Robótico)
+ * CON FILTRO DE MEDIA MÓVIL
  * 
- * Hardware: ESP32-S3 + 2 Servos + MPU6500 (opcional)
- * Comunicación: ESP-NOW broadcast
+ * Mejoras vs Sprint 1:
+ * - Recibe datos YA FILTRADOS del transmisor
+ * - Usa MPU del brazo para feedback (opcional)
+ * - Mantiene la lógica de control suave que funciona
+ * - Movimiento más estable (menos temblor)
  */
 
 #include <esp_now.h>
@@ -17,7 +20,6 @@
 #define SERVO1_PIN 6
 #define SERVO2_PIN 7
 #define LED_PIN 48
-
 #define SDA_PIN 8
 #define SCL_PIN 10
 
@@ -36,7 +38,7 @@ typedef struct struct_message {
   float gyroY;
   float gyroZ;
   unsigned long timestamp;
-  uint8_t handPosition;  // 0=abajo (servo1), 1=arriba (servo2)
+  uint8_t handPosition;
 } struct_message;
 
 struct_message receivedData;
@@ -60,17 +62,17 @@ void OnDataRecv(const esp_now_recv_info_t *recv_info, const uint8_t *incomingDat
   activeServo = receivedData.handPosition;
   digitalWrite(LED_PIN, HIGH);
   
+  // Los datos YA VIENEN FILTRADOS del transmisor
   // Mapear accel de -10 a +10 m/s² a 0-180°
-  // Multiplicamos por 10 para obtener enteros y facilitar el map()
   int targetAngle = map((int)(receivedData.accelX * 10), -100, 100, SERVO_MIN, SERVO_MAX);
   targetAngle = constrain(targetAngle, SERVO_MIN, SERVO_MAX);
   
-  // Suavizado simple: mover hacia el objetivo gradualmente (reduce temblor)
+  // Suavizado adicional: mover hacia el objetivo gradualmente
   int currentPos = (activeServo == 0) ? servo1Position : servo2Position;
   int diff = targetAngle - currentPos;
   
-  // Si la diferencia es grande, mover rápido. Si es pequeña, mover lento
-  int step = (abs(diff) > 10) ? 5 : 1;
+  // Con datos filtrados, podemos ser más agresivos en el movimiento
+  int step = (abs(diff) > 15) ? 8 : 2;
   int newPos = currentPos;
   
   if (diff > 0) {
@@ -92,29 +94,25 @@ void OnDataRecv(const esp_now_recv_info_t *recv_info, const uint8_t *incomingDat
   static int debugCounter = 0;
   if (debugCounter++ >= 20) {
     debugCounter = 0;
-    Serial.print("✓ RX | AccelX:");
+    Serial.print("✓ RX FILTRADO | AccelX:");
     Serial.print(receivedData.accelX, 2);
     Serial.print(" | Target:");
     Serial.print(targetAngle);
     Serial.print("° | Actual:");
     Serial.print(newPos);
-    Serial.print("° | Mano:");
-    Serial.print(activeServo == 0 ? "ABAJO" : "ARRIBA");
-    Serial.print(" | Servo");
+    Serial.print("° | Servo");
     Serial.println(activeServo + 1);
   }
 }
 
 // ========== SETUP ==========
 void setup() {
-  // ===== EXACTAMENTE como Test_Serial_ESP32S3.ino =====
   Serial.begin(115200);
-  delay(3000);  // Esperar 3 segundos
+  delay(3000);
   
-  // Configurar LED
   pinMode(LED_PIN, OUTPUT);
   
-  // Parpadeo inicial - CONFIRMACIÓN VISUAL
+  // Parpadeo inicial
   for(int i = 0; i < 10; i++) {
     digitalWrite(LED_PIN, HIGH);
     delay(100);
@@ -122,24 +120,23 @@ void setup() {
     delay(100);
   }
   
-  // ===== AHORA SÍ, MENSAJES =====
   Serial.println();
   Serial.println("========================================");
-  Serial.println("   RECEPTOR ESP32-S3");
-  Serial.println("   Sprint 1 - Brazo Robotico");
+  Serial.println("   SPRINT 2 - RECEPTOR");
+  Serial.println("   CON FILTRO DE MEDIA MÓVIL");
   Serial.println("========================================");
   Serial.println();
   Serial.println("LED parpadeó 10 veces - Sistema arrancando...");
   Serial.println();
   
-  // ===== WiFi SIN consultar MAC =====
+  // WiFi
   Serial.print("[1/5] WiFi... ");
   WiFi.mode(WIFI_STA);
   WiFi.disconnect();
   delay(100);
   Serial.println("OK");
   
-  // ===== Servos =====
+  // Servos
   Serial.print("[2/5] Servos... ");
   ESP32PWM::allocateTimer(0);
   ESP32PWM::allocateTimer(1);
@@ -165,7 +162,7 @@ void setup() {
   servo2.write(90);
   Serial.println("OK (movieron)");
   
-  // ===== ESP-NOW =====
+  // ESP-NOW
   Serial.print("[3/5] ESP-NOW... ");
   if (esp_now_init() != ESP_OK) {
     Serial.println("ERROR!");
@@ -177,8 +174,8 @@ void setup() {
   esp_now_register_recv_cb(OnDataRecv);
   Serial.println("OK");
   
-  // ===== MPU6500 (OPCIONAL - solo para feedback) =====
-  Serial.print("[4/5] MPU6500 Brazo (opcional)... ");
+  // MPU6500 (OPCIONAL - feedback)
+  Serial.print("[4/5] MPU6500 Brazo (feedback)... ");
   Wire.begin(SDA_PIN, SCL_PIN);
   Wire.setClock(100000);
   delay(100);
@@ -187,19 +184,19 @@ void setup() {
     mpuBrazo.setAccelerometerRange(MPU6050_RANGE_8_G);
     mpuBrazo.setGyroRange(MPU6050_RANGE_500_DEG);
     mpuBrazo.setFilterBandwidth(MPU6050_BAND_21_HZ);
-    Serial.println("OK (feedback activo)");
+    Serial.println("OK (activo)");
   } else {
     mpuBrazoReady = false;
-    Serial.println("NO DETECTADO (sistema funciona igual)");
+    Serial.println("NO DETECTADO (continúa sin él)");
   }
   
-  // ===== Listo =====
-  Serial.println("[5/5] Inicializacion completa");
+  // Listo
+  Serial.println("[5/5] Inicialización completa");
   Serial.println();
   Serial.println("========================================");
-  Serial.println("   SISTEMA LISTO");
+  Serial.println("   SISTEMA LISTO - FILTRADO ACTIVO");
   Serial.println("========================================");
-  Serial.println("Los servos se mueven con datos del GUANTE");
+  Serial.println("Datos recibidos YA están filtrados");
   Serial.println("MPU local: " + String(mpuBrazoReady ? "ACTIVO" : "DESACTIVADO"));
   Serial.println("Esperando datos del Transmisor...");
   Serial.println();
@@ -216,14 +213,15 @@ void setup() {
 // ========== LOOP ==========
 void loop() {
   static unsigned long lastPrint = 0;
+  static unsigned long lastFeedback = 0;
   static int counter = 0;
   
-  // Apagar LED (se enciende en callback)
+  // Apagar LED
   if (millis() - lastReceiveTime > 50) {
     digitalWrite(LED_PIN, LOW);
   }
   
-  // Si NO hay datos, imprimir contador cada 1 segundo
+  // Contador si no hay datos
   if (millis() - lastPrint >= 1000) {
     lastPrint = millis();
     
@@ -234,7 +232,29 @@ void loop() {
     }
   }
   
-  // Timeout - volver a centro gradualmente
+  // Feedback del MPU local (cada 2 segundos)
+  if (mpuBrazoReady && (millis() - lastFeedback >= 2000)) {
+    lastFeedback = millis();
+    
+    sensors_event_t accel, gyro, temp;
+    mpuBrazo.getEvent(&accel, &gyro, &temp);
+    
+    Serial.println("\n--- FEEDBACK MPU BRAZO ---");
+    Serial.print("Posición Real | X:");
+    Serial.print(accel.acceleration.x, 2);
+    Serial.print(" Y:");
+    Serial.print(accel.acceleration.y, 2);
+    Serial.print(" Z:");
+    Serial.print(accel.acceleration.z, 2);
+    Serial.println(" m/s²");
+    Serial.print("Servos | S1:");
+    Serial.print(servo1Position);
+    Serial.print("° S2:");
+    Serial.print(servo2Position);
+    Serial.println("°\n");
+  }
+  
+  // Timeout - volver a centro
   if (lastReceiveTime > 0 && (millis() - lastReceiveTime > TIMEOUT)) {
     if (servo1Position != 90) {
       servo1Position += (servo1Position < 90) ? 1 : -1;

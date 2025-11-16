@@ -16,19 +16,23 @@ Este es el primer sprint del proyecto de tele-operación del brazo robótico 2DO
 
 ### Transmisor (Guante)
 - **1x ESP32 WROOM** (tiene DAC para análisis de señal)
-- **1x MPU6050** (sensor inercial 6DOF)
+- **1x MPU6050** (sensor inercial 6DOF) - **OBLIGATORIO**
 - **Cables y protoboard**
 - **Guante o soporte ergonómico** para montar la IMU
 
 ### Receptor (Brazo Robótico)
 - **1x ESP32-S3** (va SIEMPRE con el brazo robótico)
+- **1x MPU6050** (feedback de posición real) - **OPCIONAL**
 - **2x Servomotores MG90S**
 - **Fuente de alimentación 5V** (mínimo 2A)
 - **Estructura mecánica del brazo** (de la práctica anterior)
 
-**NOTA IMPORTANTE**: 
+**NOTAS IMPORTANTES**: 
 - ✅ ESP32 WROOM tiene DAC (GPIO25/26) - Por eso va en el guante
 - ❌ ESP32-S3 NO tiene DAC - Por eso va en el brazo
+- ✅ Sistema usa 2x MPU6050: uno para CONTROL (guante) y otro para FEEDBACK (brazo)
+- ⚠️ El MPU6050 del guante es CRÍTICO - sin él no funciona nada
+- ⚠️ El MPU6050 del brazo es opcional - solo para verificar posición real
 
 ---
 
@@ -50,9 +54,16 @@ LED:             GPIO 2 (LED integrado)
 
 **IMPORTANTE**: ESP32 WROOM tiene DAC, por eso va en el guante
 
-### RECEPTOR (ESP32-S3 + Servos)
+### RECEPTOR (ESP32-S3 + Servos + MPU6050)
 
 ```
+MPU6050 (Brazo)  ESP32-S3
+---------------  --------
+VCC      ──────► 3.3V
+GND      ──────► GND
+SDA      ──────► GPIO 8 (I2C SDA)
+SCL      ──────► GPIO 10 (I2C SCL) ⚠️ NO usar GPIO 9
+
 Servo1 (Base)    ESP32-S3
 -------------    --------
 Señal    ──────► GPIO 12
@@ -66,14 +77,13 @@ VCC      ──────► 5V (externa)
 GND      ──────► GND común
 
 LED:             GPIO 48 (LED integrado ESP32-S3)
-
-I2C (opcional):  SDA=GPIO 8, SCL=GPIO 10 (NO usar GPIO 9)
 ```
 
 ⚠️ **IMPORTANTE ESP32-S3**: 
 - GPIO 9 tiene problemas - usar GPIO 10 para SCL
 - NUNCA usar GPIO 19/20 (USB D-/D+)
 - Conectar servos a fuente externa de 5V/2A mínimo
+- MPU6050 del brazo es opcional - sistema funciona sin él
 
 ---
 
@@ -82,11 +92,13 @@ I2C (opcional):  SDA=GPIO 8, SCL=GPIO 10 (NO usar GPIO 9)
 Instalar desde el Gestor de Librerías de Arduino IDE:
 
 ### Para el Transmisor:
-1. **Adafruit MPU6050** (by Adafruit)
-2. **Adafruit Unified Sensor** (by Adafruit)
+1. **Adafruit MPU6050** (by Adafruit) - **OBLIGATORIO**
+2. **Adafruit Unified Sensor** (by Adafruit) - **OBLIGATORIO**
 
 ### Para el Receptor:
-1. **ESP32Servo** (by Kevin Harrington)
+1. **ESP32Servo** (by Kevin Harrington) - **OBLIGATORIO**
+2. **Adafruit MPU6050** (by Adafruit) - **OPCIONAL** (solo si usas MPU en brazo)
+3. **Adafruit Unified Sensor** (by Adafruit) - **OPCIONAL** (solo si usas MPU en brazo)
 
 Las librerías de **WiFi** y **ESP-NOW** vienen incluidas con el core de ESP32.
 
