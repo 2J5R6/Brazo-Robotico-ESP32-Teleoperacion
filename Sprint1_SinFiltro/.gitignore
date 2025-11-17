@@ -1,0 +1,46 @@
+# Arduino/PlatformIO Build Files
+*.bin
+*.elf
+*.hex
+*.map
+build/
+.pio/
+.pioenvs/
+.piolibdeps/
+
+# IDE Files
+.vscode/
+.idea/
+*.code-workspace
+*.sublime-*
+
+# System Files
+.DS_Store
+Thumbs.db
+desktop.ini
+*.swp
+*.swo
+*~
+
+# Python (para scripts de análisis)
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+venv/
+env/
+*.egg-info/
+
+# Logs y Datos Temporales
+*.log
+*.tmp
+*.bak
+*.old
+datos_raw/
+capturas_temp/
+
+# Archivos de Configuración Personal
+credentials.h
+secrets.h
+local_config.h
