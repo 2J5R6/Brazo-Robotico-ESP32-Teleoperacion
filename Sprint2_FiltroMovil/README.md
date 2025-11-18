@@ -1,5 +1,12 @@
 # Sprint 2 - Sistema de Teleoperación con Filtrado Avanzado
 
+## Autor
+**Julián Andrés Rosas Sánchez**  
+Ingeniería Mecatrónica  
+Universidad Militar Nueva Granada
+
+---
+
 ## 📋 Descripción
 
 Sistema de control de brazo robótico mediante guante con MPU6050, implementando **filtrado digital multi-capa** para eliminar tremor y mejorar precisión. Comunicación ESP-NOW a 100Hz entre ESP32 WROOM (transmisor) y ESP32-S3 (receptor).

@@ -1,5 +1,12 @@
 # 🎯 SISTEMA DE TELEOPERACIÓN - 3 SPRINTS
 
+## Autor
+**Julián Andrés Rosas Sánchez**  
+Ingeniería Mecatrónica  
+Universidad Militar Nueva Granada
+
+---
+
 ## 📊 COMPARATIVA DE SPRINTS
 
 | Sprint | Filtro | Temblor | MPU Brazo | Complejidad | Precisión |

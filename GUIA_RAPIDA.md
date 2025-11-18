@@ -1,5 +1,12 @@
 # 🚀 GUÍA RÁPIDA - CAMBIO ENTRE SPRINTS
 
+## Autor
+**Julián Andrés Rosas Sánchez**  
+Ingeniería Mecatrónica  
+Universidad Militar Nueva Granada
+
+---
+
 ## ✅ Sprint 1 - COMPLETADO
 
 Ya probaste y funciona. Los servos se mueven con temblor (esperado).

@@ -63,7 +63,7 @@ public:
 };
 
 IIRFilter iirServo1(0.85);  // Suavizado adicional
-IIRFilter iirServo2(0.85);
+IIRFilter iirServo2(0.95);  // Servo2 ultra-agresivo (elimina tremor accel)
 
 // Variables de control
 float servo1Current = 90.0;
@@ -72,10 +72,17 @@ float servo1Target = 90.0;
 float servo2Target = 90.0;
 
 uint8_t activeServo = 1;
+uint8_t lastActiveServo = 1;
+unsigned long lastModeChange = 0;
+unsigned long lastMovement = 0;  // Último movimiento detectado
 unsigned long lastReceiveTime = 0;
 unsigned long lastUpdate = 0;
+bool inTransition = false;
 const unsigned long TIMEOUT = 500;
+const unsigned long STILLNESS_TIME = 1000;  // 1 segundo quieto para cambiar modo
 const float UPDATE_INTERVAL = 5;  // 200Hz
+const float DEADZONE_SERVO2 = 0.3;  // Zona muerta ±0.3 m/s²
+const float MOVEMENT_THRESHOLD = 5.0;  // Umbral para detectar movimiento (grados)
 
 const int SERVO_MIN = 10;
 const int SERVO_MAX = 170;
@@ -84,7 +91,39 @@ const int SERVO_MAX = 170;
 void OnDataRecv(const esp_now_recv_info_t *recv_info, const uint8_t *incomingData, int len) {
   memcpy(&receivedData, incomingData, sizeof(receivedData));
   lastReceiveTime = millis();
-  activeServo = receivedData.handPosition;
+  
+  // Detectar si hay movimiento significativo
+  static float lastServo1 = 90.0;
+  static float lastServo2 = 90.0;
+  
+  float movementS1 = abs(servo1Current - lastServo1);
+  float movementS2 = abs(servo2Current - lastServo2);
+  
+  if (movementS1 > 1.0 || movementS2 > 1.0) {
+    lastMovement = millis();  // Actualizar tiempo de último movimiento
+  }
+  
+  lastServo1 = servo1Current;
+  lastServo2 = servo2Current;
+  
+  // Calcular tiempo de quietud
+  unsigned long stillTime = millis() - lastMovement;
+  bool isStill = (stillTime >= STILLNESS_TIME);  // Quieto por 1s?
+  
+  // Cambio de modo: solo si mano está quieta por 1s
+  if (receivedData.handPosition != activeServo) {
+    if (isStill) {
+      // Mano quieta → permitir cambio suave
+      activeServo = receivedData.handPosition;
+      lastModeChange = millis();
+      lastMovement = millis();  // Resetear contador
+      
+      Serial.print("\n➡ CAMBIO MODO: ");
+      Serial.println(activeServo == 0 ? "✋VERTICAL" : "👉HORIZONTAL");
+    }
+    // Si no está quieta, ignorar cambio (mantener modo actual)
+  }
+  
   digitalWrite(LED_PIN, HIGH);
   
   // Mapeo según modo
@@ -111,9 +150,23 @@ void OnDataRecv(const esp_now_recv_info_t *recv_info, const uint8_t *incomingDat
     servo1Target = gyroIntegrated;
     
   } else {
-    // HORIZONTAL: Servo2 con AccelY
+    // HORIZONTAL: Servo2 con AccelY (filtrado extra + zona muerta)
     sensorValue = receivedData.accelY_filtered;
-    mappedAngle = map(sensorValue * 100, 250, -250, SERVO_MIN, SERVO_MAX);
+    
+    // Zona muerta: ignorar movimientos pequeños cerca del centro
+    if (abs(sensorValue) < DEADZONE_SERVO2) {
+      sensorValue = 0;  // Forzar a cero en zona muerta
+    }
+    
+    // Buffer de 5 muestras para estabilización adicional (era 3)
+    static float accelY_buffer[5] = {0, 0, 0, 0, 0};
+    static int buffer_idx = 0;
+    accelY_buffer[buffer_idx] = sensorValue;
+    buffer_idx = (buffer_idx + 1) % 5;
+    float accelY_avg = (accelY_buffer[0] + accelY_buffer[1] + accelY_buffer[2] + 
+                        accelY_buffer[3] + accelY_buffer[4]) / 5.0;
+    
+    mappedAngle = map(accelY_avg * 100, 250, -250, SERVO_MIN, SERVO_MAX);
     mappedAngle = constrain(mappedAngle, SERVO_MIN, SERVO_MAX);
     servo2Target = mappedAngle;
   }
@@ -122,16 +175,23 @@ void OnDataRecv(const esp_now_recv_info_t *recv_info, const uint8_t *incomingDat
   static int debugCount = 0;
   if (debugCount++ >= 25) {
     debugCount = 0;
-    Serial.print("✓ RX | ");
+    
+    // Mostrar indicador de quietud
+    if (!isStill && receivedData.handPosition != activeServo) {
+      Serial.print("⏳ ESPERA ");
+      Serial.print((STILLNESS_TIME - stillTime) / 1000.0, 1);
+      Serial.print("s | ");
+    } else {
+      Serial.print("✓ RX | ");
+    }
+    
     Serial.print(activeServo == 0 ? "✋VERT" : "👉HORIZ");
     Serial.print(" | Val:");
     Serial.print(sensorValue, 1);
-    Serial.print(" | KVar:");
-    Serial.print(receivedData.kalman_variance, 4);
-    Serial.print(" | S");
-    Serial.print(activeServo + 1);
-    Serial.print(":");
-    Serial.print((int)(activeServo == 0 ? servo1Current : servo2Current));
+    Serial.print(" | S1:");
+    Serial.print((int)servo1Current);
+    Serial.print("° S2:");
+    Serial.print((int)servo2Current);
     Serial.println("°");
   }
 }
@@ -170,7 +230,12 @@ void updateServoSmooth(Servo &servo, float &current, float target, IIRFilter &ii
 // ========== SETUP ==========
 void setup() {
   Serial.begin(115200);
-  delay(2000);
+  while(!Serial && millis() < 3000);  // Esperar conexión serial
+  delay(500);
+  
+  Serial.println("\n\n\n>>> RECEPTOR INICIANDO <<<");
+  Serial.println("Baudrate: 115200");
+  Serial.flush();
   
   pinMode(LED_PIN, OUTPUT);
   

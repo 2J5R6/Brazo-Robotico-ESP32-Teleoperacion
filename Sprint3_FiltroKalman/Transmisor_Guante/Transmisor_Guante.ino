@@ -131,9 +131,10 @@ public:
 };
 
 // ========== INSTANCIAS DE FILTROS ==========
-// Pre-filtros FIR
+// Pre-filtros FIR (todos usan FIR_WINDOW=20)
 FIRFilter firAccelX, firAccelY, firAccelZ;
 FIRFilter firGyroX, firGyroY, firGyroZ;
+// Nota: AccelY usa ventana completa (20), mejora filtrado para servo2
 
 // Filtros de Kalman (uno por cada eje angular)
 KalmanFilter kalmanPitch;  // Rotación en eje Y
@@ -144,6 +145,15 @@ unsigned long lastTransmit = 0;
 unsigned long lastDebug = 0;
 unsigned long lastKalmanUpdate = 0;
 const float dt = 0.01;  // 100Hz = 10ms = 0.01s
+
+// Variables para filtro de cambio brusco
+static float last_accelY = 0;
+static bool accelY_frozen = false;
+static unsigned long freeze_start_time = 0;
+const float SUDDEN_CHANGE_THRESHOLD = 1.5;  // m/s²
+const unsigned long FREEZE_DURATION = 300;  // ms
+const float NEAR_ZERO_MIN = -0.6;           // Rango cercano a 0
+const float NEAR_ZERO_MAX = 0.8;
 
 // ========== CALLBACK ESP-NOW ==========
 void OnDataSent(const wifi_tx_info_t *mac_addr, esp_now_send_status_t status) {
@@ -177,7 +187,8 @@ void setup() {
   // I2C
   Serial.print("[1/4] I2C... ");
   Wire.begin(SDA_PIN, SCL_PIN);
-  Wire.setClock(100000);
+  Wire.setClock(50000);  // Reducido a 50kHz (más estable en movimiento)
+  Wire.setTimeOut(5000); // Timeout de 5ms para evitar cuelgues
   delay(100);
   Serial.println("OK");
   
@@ -270,9 +281,29 @@ void loop() {
   // Transmitir a 100Hz
   if (now - lastTransmit >= TRANSMIT_INTERVAL) {
     
-    // Leer MPU
+    // Leer MPU con manejo de errores I2C
     sensors_event_t a, g, temp;
-    mpu.getEvent(&a, &g, &temp);
+    
+    // Intentar leer MPU (puede fallar durante movimiento brusco)
+    bool read_success = false;
+    for(int retry = 0; retry < 3 && !read_success; retry++) {
+      if (mpu.getEvent(&a, &g, &temp)) {
+        read_success = true;
+      } else {
+        delayMicroseconds(100);  // Pequeña pausa antes de reintentar
+      }
+    }
+    
+    // Si falla lectura I2C, usar últimos valores conocidos
+    static sensors_event_t last_a, last_g;
+    if (!read_success) {
+      a = last_a;
+      g = last_g;
+      // Serial.println("⚠ I2C retry"); // Descomenta para debug
+    } else {
+      last_a = a;
+      last_g = g;
+    }
     
     // 1. PRE-FILTRADO FIR
     float accelX_fir = firAccelX.update(a.acceleration.x);
@@ -281,6 +312,29 @@ void loop() {
     float gyroX_fir = firGyroX.update(g.gyro.x);
     float gyroY_fir = firGyroY.update(g.gyro.y);
     float gyroZ_fir = firGyroZ.update(g.gyro.z);
+    
+    // FILTRO DE CAMBIO BRUSCO (solo si AccelY está cerca de 0)
+    bool is_near_zero = (last_accelY >= NEAR_ZERO_MIN && last_accelY <= NEAR_ZERO_MAX);
+    float accelY_delta = abs(accelY_fir - last_accelY);
+    
+    // Si está cerca de 0 y hay cambio brusco > 1.5: congelar
+    if (is_near_zero && accelY_delta > SUDDEN_CHANGE_THRESHOLD && !accelY_frozen) {
+      accelY_frozen = true;
+      freeze_start_time = now;
+      accelY_fir = last_accelY;  // Mantener valor anterior
+    }
+    
+    // Descongelar después de 300ms
+    if (accelY_frozen && (now - freeze_start_time >= FREEZE_DURATION)) {
+      accelY_frozen = false;
+    }
+    
+    // Si está congelado, mantener último valor
+    if (accelY_frozen) {
+      accelY_fir = last_accelY;
+    } else {
+      last_accelY = accelY_fir;  // Actualizar solo si no está congelado
+    }
     
     // 2. FILTRO DE KALMAN (fusión accel + gyro)
     // Calcular ángulos desde acelerómetro
@@ -314,18 +368,54 @@ void loop() {
     sensorData.timestamp = now;
     sensorData.kalman_variance = (kalmanPitch.getVariance() + kalmanRoll.getVariance()) / 2;
     
-    // Detección de orientación (mismo método Sprint 2)
+    // Detección de orientación SIMPLE y ROBUSTA
     float absZ = abs(accelZ_fir);
+    
+    // Filtro promedio sobre AccelZ (15 muestras para suavizar)
+    static float accelZ_history[15] = {0};
+    static int z_idx = 0;
+    accelZ_history[z_idx] = absZ;
+    z_idx = (z_idx + 1) % 15;
+    float absZ_avg = 0;
+    for(int i = 0; i < 15; i++) absZ_avg += accelZ_history[i];
+    absZ_avg /= 15.0;
+    
     static uint8_t lastPos = 1;
-    if (absZ > 8.0) {
-      sensorData.handPosition = 0;  // VERTICAL
-      lastPos = 0;
-    } else if (absZ < 4.0) {
-      sensorData.handPosition = 1;  // HORIZONTAL
-      lastPos = 1;
-    } else {
-      sensorData.handPosition = lastPos;
+    static int stability_counter = 0;
+    
+    // Umbrales con histéresis amplia
+    uint8_t newPos = lastPos;
+    if (absZ_avg > 8) {        // Detecta VERTICAL (más restrictivo)
+      newPos = 0;
+    } else if (absZ_avg < 2.5) { // Detecta HORIZONTAL (más restrictivo)
+      newPos = 1;
     }
+    // Entre 2.5 y 9.2: mantiene estado anterior (zona de histéresis)
+    
+    // Requerir 20 lecturas consistentes para HORIZONTAL→VERTICAL
+    // Solo 5 lecturas para VERTICAL→HORIZONTAL (rápido)
+    int required_count = 5;  // Por defecto rápido
+    
+    if (lastPos == 1 && newPos == 0) {
+      // HORIZONTAL → VERTICAL: más conservador (20 lecturas = 0.2s)
+      required_count = 20;
+    } else if (lastPos == 0 && newPos == 1) {
+      // VERTICAL → HORIZONTAL: más rápido (5 lecturas = 0.05s)
+      required_count = 5;
+    }
+    
+    // Contador de estabilidad
+    if (newPos != lastPos) {
+      stability_counter++;
+      if (stability_counter >= required_count) {
+        lastPos = newPos;
+        stability_counter = 0;
+      }
+    } else {
+      stability_counter = 0;  // Reset si no hay cambio
+    }
+    
+    sensorData.handPosition = lastPos;
     
     // Transmitir
     esp_now_send(broadcastAddress, (uint8_t*)&sensorData, sizeof(sensorData));
@@ -337,16 +427,19 @@ void loop() {
   if (now - lastDebug >= 500) {
     lastDebug = now;
     
-    Serial.print("📡 Kalman | Pitch:");
-    Serial.print(sensorData.angle_pitch, 2);
-    Serial.print("° Roll:");
-    Serial.print(sensorData.angle_roll, 2);
-    Serial.print("° | Var:");
-    Serial.print(sensorData.kalman_variance, 4);
-    Serial.print(" | K_gain:");
-    Serial.print(kalmanPitch.getGain(), 3);
-    Serial.print(" | ");
-    Serial.println(sensorData.handPosition == 0 ? "✋VERTICAL" : "👉HORIZONTAL");
+    Serial.print("📡 TX | ");
+    Serial.print(sensorData.handPosition == 0 ? "✋VERT" : "👉HORIZ");
+    Serial.print(" | |Z|:");
+    Serial.print(abs(sensorData.accelZ_filtered), 1);
+    Serial.print(" | AccelY:");
+    Serial.print(sensorData.accelY_filtered, 2);
+    
+    // Mostrar estado de congelamiento
+    if (accelY_frozen) {
+      Serial.print(" | ⏸ CONGELADO");
+    }
+    
+    Serial.println();
   }
   
   delay(2);

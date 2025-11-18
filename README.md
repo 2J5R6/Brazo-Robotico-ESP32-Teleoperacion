@@ -1,8 +1,9 @@
 # Sistema de Tele-operación - Brazo Robótico 2DOF
 
-## 📚 Laboratorio de Señales - Práctica 3
-**Universidad Militar Nueva Granada**  
-**Semestre VI - Noviembre 2025**
+## Autor
+**Julián Andrés Rosas Sánchez**  
+Ingeniería Mecatrónica  
+Universidad Militar Nueva Granada
 
 ---
 
