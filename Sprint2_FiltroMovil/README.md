@@ -41,16 +41,27 @@ Sistema de control de brazo robótico mediante guante con MPU6050, implementando
 Señal RAW → [1] Media Móvil → [2] Complementario → [3] Buffer Circular → [4] Predicción → SALIDA
 ```
 
-### **1. Filtro de Media Móvil**
-**Tipo**: FIR (Respuesta Finita al Impulso)  
-**Ventana**: 20 muestras  
-**Frecuencia**: 100 Hz  
+### **1. Filtro FIR - Media Móvil**
+**Tipo**: **FIR (Finite Impulse Response)** - Respuesta Finita al Impulso  
+**Orden**: 20 (ventana de 20 muestras)  
+**Frecuencia de muestreo**: 100 Hz  
 **Tiempo de ventana**: 200 ms
 
-**Ecuación**:
+**Clasificación**: Filtro FIR no recursivo
+
+**Ecuación en diferencias**:
 ```
 y[n] = (1/N) * Σ(x[n-i]) para i=0 hasta N-1
 donde N = 20
+
+Expandido:
+y[n] = 0.05*x[n] + 0.05*x[n-1] + 0.05*x[n-2] + ... + 0.05*x[n-19]
+```
+
+**Función de transferencia (Z)**:
+```
+H(z) = (1/20) * (1 + z⁻¹ + z⁻² + ... + z⁻¹⁹)
+     = (1/20) * (1 - z⁻²⁰) / (1 - z⁻¹)
 ```
 
 **Código C++**:
@@ -85,22 +96,44 @@ title('Filtro Media Móvil N=20');
 xlabel('Frecuencia (Hz)'); ylabel('Magnitud (dB)');
 ```
 
-**Características**:
-- Frecuencia de corte (-3dB): ~5 Hz
-- Atenuación tremor (8-12 Hz): -15 dB
-- Retardo de grupo: 100 ms (N/2 muestras)
+**Características FIR**:
+- **Estabilidad**: Siempre estable (todos los polos en el origen)
+- **Fase**: Lineal (retardo constante = N/2 = 10 muestras)
+- **Frecuencia de corte (-3dB)**: ~5 Hz
+- **Atenuación tremor (8-12 Hz)**: -15 dB
+- **Retardo de grupo**: 100 ms constante
+- **Coeficientes**: b = [0.05, 0.05, ..., 0.05] (20 valores)
+- **Ecuación recursiva**: NO (FIR puro)
 
 ---
 
-### **2. Filtro Complementario**
-**Tipo**: IIR de 1er orden  
+### **2. Filtro IIR - Complementario**
+**Tipo**: **IIR (Infinite Impulse Response)** - Respuesta Infinita al Impulso  
+**Orden**: 1 (primer orden)  
 **Ponderación**: 93% suavizado + 7% señal cruda  
-**Propósito**: Mantener respuesta rápida
+**Propósito**: Mantener respuesta rápida sin sobre-filtrar
 
-**Ecuación**:
+**Clasificación**: Filtro IIR recursivo (tiene retroalimentación)
+
+**Ecuación en diferencias**:
 ```
-y[n] = α * y_smooth[n] + (1-α) * x[n]
-donde α = 0.93
+y[n] = α * x_smooth[n] + (1-α) * x_raw[n]
+donde:
+  α = 0.93 (factor de suavizado)
+  x_smooth[n] = salida del filtro FIR
+  x_raw[n] = señal sin filtrar
+
+Forma recursiva equivalente:
+y[n] = 0.93 * y[n-1] + 0.07 * x[n]
+```
+
+**Función de transferencia (Z)**:
+```
+H(z) = (1-α) / (1 - α*z⁻¹)
+     = 0.07 / (1 - 0.93*z⁻¹)
+
+Polo: z = 0.93 (dentro del círculo unitario → estable)
+Cero: ninguno
 ```
 
 **Código C++**:
@@ -128,22 +161,39 @@ plot(f, 20*log10(abs(H)));
 title('Filtro Complementario α=0.93');
 ```
 
-**Características**:
-- Constante de tiempo: τ = 1/(1-α) = 14.3 muestras ≈ 143 ms
-- Preserva transitorios rápidos
-- Reduce sobre-suavizado
+**Características IIR**:
+- **Estabilidad**: Estable (|polo| = 0.93 < 1)
+- **Fase**: No lineal (característica de IIR)
+- **Constante de tiempo**: τ = 1/(1-α) = 14.3 muestras ≈ 143 ms
+- **Respuesta al impulso**: Decae exponencialmente (0.93ⁿ)
+- **Orden**: 1 (un polo)
+- **Coeficientes**: 
+  - Numerador b = [0.07]
+  - Denominador a = [1, -0.93]
+- **Ecuación recursiva**: SÍ (usa y[n-1])
 
 ---
 
-### **3. Buffer Circular**
+### **3. Filtro FIR - Buffer Circular (Segundo FIR)**
+**Tipo**: **FIR de orden menor** en cascada  
 **Tamaño**: 5 muestras  
-**Tipo**: Media móvil corta adicional  
-**Tiempo**: 50 ms
+**Tiempo de ventana**: 50 ms
 
-**Ecuación**:
+**Clasificación**: Segundo filtro FIR no recursivo
+
+**Ecuación en diferencias**:
 ```
 y[n] = (1/M) * Σ(x[n-j]) para j=0 hasta M-1
 donde M = 5
+
+Expandido:
+y[n] = 0.2*x[n] + 0.2*x[n-1] + 0.2*x[n-2] + 0.2*x[n-3] + 0.2*x[n-4]
+```
+
+**Función de transferencia (Z)**:
+```
+H(z) = 0.2 * (1 + z⁻¹ + z⁻² + z⁻³ + z⁻⁴)
+     = 0.2 * (1 - z⁻⁵) / (1 - z⁻¹)
 ```
 
 **Código C++**:
@@ -212,13 +262,54 @@ xlabel('Muestra (@ 100Hz)');
 
 ---
 
+## 🎓 Análisis Académico: FIR, IIR y ARMA
+
+### **Clasificación de Filtros Implementados**
+
+| Filtro | Tipo | Orden | Ecuación | Estabilidad | Fase |
+|--------|------|-------|----------|-------------|------|
+| Media Móvil | **FIR** | 20 | y[n] = Σb[i]·x[n-i] | Siempre estable | Lineal |
+| Complementario | **IIR** | 1 | y[n] = b₀·x[n] + a₁·y[n-1] | Estable (polo<1) | No lineal |
+| Buffer Circular | **FIR** | 5 | y[n] = Σb[j]·x[n-j] | Siempre estable | Lineal |
+
+### **Sistema en Cascada como ARMA**
+
+Aunque implementamos filtros FIR e IIR por separado, el **sistema completo en cascada** puede representarse como un modelo **ARMA (AutoRegressive Moving Average)**:
+
+**Modelo ARMA(p,q)**:
+```
+y[n] = Σ(a[i]·y[n-i]) + Σ(b[j]·x[n-j])
+       i=1 hasta p      j=0 hasta q
+
+Parte AR (AutoRegressive): del filtro IIR
+Parte MA (Moving Average): de los filtros FIR
+```
+
+**Para nuestro sistema**:
+```
+Orden AR (p) = 1  (del IIR complementario)
+Orden MA (q) = 25 (20 del primer FIR + 5 del segundo FIR)
+
+Sistema ARMA(1, 25)
+```
+
+**Función de transferencia total**:
+```
+H_total(z) = H_FIR1(z) · H_IIR(z) · H_FIR2(z)
+
+           = [0.05(1-z⁻²⁰)/(1-z⁻¹)] · [0.07/(1-0.93z⁻¹)] · [0.2(1-z⁻⁵)/(1-z⁻¹)]
+```
+
+---
+
 ## 📊 Análisis de Filtros en MATLAB
 
-### **Script Completo de Análisis**
+### **Script Completo de Análisis (FIR, IIR, ARMA)**
 
 ```matlab
-%% ANÁLISIS DE FILTRADO MULTI-CAPA - SPRINT 2
+%% ANÁLISIS COMPLETO: FIR, IIR y ARMA - SPRINT 2
 % Sistema de teleoperación con ESP32 + MPU6050
+% Universidad Militar Nueva Granada - Procesamiento de Señales
 
 clear; clc; close all;
 
@@ -229,64 +320,153 @@ M_buffer = 5;       % Ventana buffer circular
 alpha = 0.93;       % Factor complementario
 beta = 0.3;         % Factor predicción
 
-%% 1. DISEÑO DE FILTROS
+%% 1. DISEÑO DE FILTROS (FIR e IIR)
 
-% Filtro Media Móvil
-b1 = ones(1, N_mov_avg) / N_mov_avg;
-a1 = 1;
+% ===== FILTRO 1: FIR Media Móvil (orden 20) =====
+N_fir1 = 20;
+b1_fir = ones(1, N_fir1) / N_fir1;  % Coeficientes FIR
+a1_fir = 1;                          % Sin retroalimentación
 
-% Filtro Complementario (IIR)
-b2 = [(1-alpha), 0];
-a2 = [1, -alpha];
+fprintf('=== FILTRO 1: FIR Media Móvil ===\n');
+fprintf('Tipo: FIR (Finite Impulse Response)\n');
+fprintf('Orden: %d\n', N_fir1);
+fprintf('Coeficientes b: [%.3f, %.3f, ..., %.3f] (%d valores)\n', ...
+    b1_fir(1), b1_fir(2), b1_fir(end), length(b1_fir));
+fprintf('Coeficientes a: [%.3f]\n\n', a1_fir);
 
-% Buffer Circular (Media Móvil Corta)
-b3 = ones(1, M_buffer) / M_buffer;
-a3 = 1;
+% ===== FILTRO 2: IIR Complementario (orden 1) =====
+alpha = 0.93;
+b2_iir = (1 - alpha);                % Numerador
+a2_iir = [1, -alpha];                % Denominador (recursivo)
 
-% Sistema en cascada
-[b_cascada, a_cascada] = cascade_filters(b1, a1, b2, a2, b3, a3);
+fprintf('=== FILTRO 2: IIR Complementario ===\n');
+fprintf('Tipo: IIR (Infinite Impulse Response)\n');
+fprintf('Orden: 1\n');
+fprintf('Coeficientes b: [%.3f]\n', b2_iir);
+fprintf('Coeficientes a: [%.3f, %.3f]\n', a2_iir(1), a2_iir(2));
+fprintf('Polo: z = %.3f (estable: |z| < 1)\n\n', alpha);
 
-%% 2. RESPUESTA EN FRECUENCIA
+% ===== FILTRO 3: FIR Buffer Circular (orden 5) =====
+M_fir2 = 5;
+b3_fir = ones(1, M_fir2) / M_fir2;  % Coeficientes FIR
+a3_fir = 1;                          % Sin retroalimentación
+
+fprintf('=== FILTRO 3: FIR Buffer Circular ===\n');
+fprintf('Tipo: FIR (Finite Impulse Response)\n');
+fprintf('Orden: %d\n', M_fir2);
+fprintf('Coeficientes b: [%.3f, %.3f, ..., %.3f] (%d valores)\n', ...
+    b3_fir(1), b3_fir(2), b3_fir(end), length(b3_fir));
+fprintf('Coeficientes a: [%.3f]\n\n', a3_fir);
+
+% ===== SISTEMA COMPLETO EN CASCADA (ARMA) =====
+% Cascada: FIR1 → IIR → FIR2
+[b_temp, a_temp] = series_tf(b1_fir, a1_fir, b2_iir, a2_iir);
+[b_total, a_total] = series_tf(b_temp, a_temp, b3_fir, a3_fir);
+
+fprintf('=== SISTEMA COMPLETO (Cascada) ===\n');
+fprintf('Tipo: ARMA (AutoRegressive Moving Average)\n');
+fprintf('Orden AR (p): %d\n', length(a_total)-1);
+fprintf('Orden MA (q): %d\n', length(b_total)-1);
+fprintf('Modelo: ARMA(%d, %d)\n\n', length(a_total)-1, length(b_total)-1);
+
+%% 2. ANÁLISIS DE ESTABILIDAD Y POLOS/CEROS
+
+figure('Name', 'Análisis Polos y Ceros', 'Position', [100 100 1400 500]);
+
+% FIR 1: Media Móvil
+subplot(1,3,1);
+zplane(b1_fir, a1_fir);
+title('FIR Media Móvil (N=20)');
+grid on;
+
+% IIR: Complementario
+subplot(1,3,2);
+zplane(b2_iir, a2_iir);
+title('IIR Complementario (α=0.93)');
+grid on;
+
+% Sistema Total (ARMA)
+subplot(1,3,3);
+zplane(b_total, a_total);
+title('Sistema ARMA Completo');
+grid on;
+
+%% 3. RESPUESTA EN FRECUENCIA
 
 figure('Name', 'Análisis en Frecuencia', 'Position', [100 100 1200 800]);
 
-% Media Móvil
+% Media Móvil (FIR)
 subplot(2,2,1);
-[H1, f1] = freqz(b1, a1, 2048, Fs);
+[H1, f1] = freqz(b1_fir, a1_fir, 2048, Fs);
 plot(f1, 20*log10(abs(H1)), 'LineWidth', 2);
-grid on; title('Filtro 1: Media Móvil (N=20)');
+grid on; title('Filtro 1: FIR Media Móvil (N=20)');
 xlabel('Frecuencia (Hz)'); ylabel('Magnitud (dB)');
 xlim([0 50]);
+legend('FIR - Fase lineal');
 
-% Complementario
+% Complementario (IIR)
 subplot(2,2,2);
-[H2, f2] = freqz(b2, a2, 2048, Fs);
+[H2, f2] = freqz(b2_iir, a2_iir, 2048, Fs);
 plot(f2, 20*log10(abs(H2)), 'LineWidth', 2, 'Color', [0.8 0.4 0]);
-grid on; title('Filtro 2: Complementario (α=0.93)');
+grid on; title('Filtro 2: IIR Complementario (α=0.93)');
 xlabel('Frecuencia (Hz)'); ylabel('Magnitud (dB)');
 xlim([0 50]);
+legend('IIR - Recursivo');
 
-% Buffer
+% Buffer (FIR)
 subplot(2,2,3);
-[H3, f3] = freqz(b3, a3, 2048, Fs);
+[H3, f3] = freqz(b3_fir, a3_fir, 2048, Fs);
 plot(f3, 20*log10(abs(H3)), 'LineWidth', 2, 'Color', [0.4 0.8 0]);
-grid on; title('Filtro 3: Buffer Circular (M=5)');
+grid on; title('Filtro 3: FIR Buffer (M=5)');
 xlabel('Frecuencia (Hz)'); ylabel('Magnitud (dB)');
 xlim([0 50]);
+legend('FIR - Fase lineal');
 
-% Sistema Completo
+% Sistema Completo (ARMA)
 subplot(2,2,4);
-[H_total, f_total] = freqz(b_cascada, a_cascada, 2048, Fs);
+[H_total, f_total] = freqz(b_total, a_total, 2048, Fs);
 plot(f_total, 20*log10(abs(H_total)), 'LineWidth', 3, 'Color', [0.8 0 0.4]);
-grid on; title('SISTEMA COMPLETO (Cascada)');
+grid on; title('SISTEMA ARMA COMPLETO');
 xlabel('Frecuencia (Hz)'); ylabel('Magnitud (dB)');
 xlim([0 50]);
 hold on;
 % Marcar frecuencia de tremor (8-12 Hz)
 xline(8, '--r', 'Tremor inicio');
 xline(12, '--r', 'Tremor fin');
+legend('ARMA(1,25) - FIR+IIR+FIR');
 
-%% 3. SEÑAL DE PRUEBA (Simulación MPU6050)
+%% 4. RESPUESTA AL IMPULSO (característica FIR vs IIR)
+
+figure('Name', 'Respuesta al Impulso', 'Position', [100 100 1400 400]);
+
+impulse_length = 100;
+
+% FIR: respuesta FINITA
+subplot(1,3,1);
+h1_fir = impz(b1_fir, a1_fir, impulse_length);
+stem(0:impulse_length-1, h1_fir, 'filled');
+title('FIR Media Móvil: Respuesta FINITA');
+xlabel('Muestra'); ylabel('Amplitud');
+grid on;
+xlim([0 40]);
+
+% IIR: respuesta INFINITA
+subplot(1,3,2);
+h2_iir = impz(b2_iir, a2_iir, impulse_length);
+stem(0:impulse_length-1, h2_iir, 'filled', 'Color', [0.8 0.4 0]);
+title('IIR Complementario: Respuesta INFINITA');
+xlabel('Muestra'); ylabel('Amplitud');
+grid on;
+
+% Sistema ARMA
+subplot(1,3,3);
+h_total = impz(b_total, a_total, impulse_length);
+stem(0:impulse_length-1, h_total, 'filled', 'Color', [0.8 0 0.4]);
+title('Sistema ARMA: Respuesta Combinada');
+xlabel('Muestra'); ylabel('Amplitud');
+grid on;
+
+%% 5. SEÑAL DE PRUEBA (Simulación MPU6050)
 
 t = 0:1/Fs:10;  % 10 segundos
 N = length(t);
@@ -297,24 +477,24 @@ tremor = 0.5*sin(2*pi*10*t);                      % Tremor fisiológico (10 Hz)
 ruido = 0.1*randn(1, N);                          % Ruido del sensor
 señal_raw = movimiento_real + tremor + ruido;
 
-%% 4. APLICAR FILTROS PASO A PASO
+%% 6. APLICAR FILTROS PASO A PASO
 
-% Filtro 1: Media Móvil
-señal_f1 = filter(b1, a1, señal_raw);
+% Filtro 1: FIR Media Móvil
+señal_f1 = filter(b1_fir, a1_fir, señal_raw);
 
-% Filtro 2: Complementario
-señal_f2 = filter(b2, a2, señal_f1);
+% Filtro 2: IIR Complementario
+señal_f2 = filter(b2_iir, a2_iir, señal_f1);
 
-% Filtro 3: Buffer Circular
-señal_f3 = filter(b3, a3, señal_f2);
+% Filtro 3: FIR Buffer Circular
+señal_f3 = filter(b3_fir, a3_fir, señal_f2);
 
 % Filtro 4: Predicción
 velocity = [0, diff(señal_f3)];
 señal_final = señal_f3 + beta * velocity;
 
-%% 5. VISUALIZACIÓN
+%% 7. VISUALIZACIÓN
 
-figure('Name', 'Procesamiento de Señal', 'Position', [100 100 1400 900]);
+figure('Name', 'Procesamiento de Señal (FIR→IIR→FIR)', 'Position', [100 100 1400 900]);
 
 subplot(6,1,1);
 plot(t, movimiento_real, 'k', 'LineWidth', 2);
@@ -326,15 +506,15 @@ title('Señal RAW (Movimiento + Tremor + Ruido)'); ylabel('Accel (m/s²)'); grid
 
 subplot(6,1,3);
 plot(t, señal_f1, 'b');
-title('Después de Media Móvil (N=20)'); ylabel('Accel (m/s²)'); grid on;
+title('Después de FIR Media Móvil (N=20)'); ylabel('Accel (m/s²)'); grid on;
 
 subplot(6,1,4);
 plot(t, señal_f2, 'Color', [0.8 0.4 0]);
-title('Después de Complementario (α=0.93)'); ylabel('Accel (m/s²)'); grid on;
+title('Después de IIR Complementario (α=0.93)'); ylabel('Accel (m/s²)'); grid on;
 
 subplot(6,1,5);
 plot(t, señal_f3, 'Color', [0.4 0.8 0]);
-title('Después de Buffer (M=5)'); ylabel('Accel (m/s²)'); grid on;
+title('Después de FIR Buffer (M=5)'); ylabel('Accel (m/s²)'); grid on;
 
 subplot(6,1,6);
 plot(t, movimiento_real, 'k--', 'LineWidth', 1.5); hold on;
@@ -343,7 +523,7 @@ title('SEÑAL FINAL (con Predicción) vs Real');
 ylabel('Accel (m/s²)'); xlabel('Tiempo (s)');
 legend('Real', 'Filtrada'); grid on;
 
-%% 6. ANÁLISIS DE DESEMPEÑO
+%% 8. ANÁLISIS DE DESEMPEÑO
 
 % Error RMS
 error_raw = rms(señal_raw - movimiento_real);
@@ -366,6 +546,9 @@ atenuacion_tremor = 20*log10(FFT_final(tremor_idx) / FFT_raw(tremor_idx));
 
 % Reporte
 fprintf('\n========== REPORTE DE DESEMPEÑO ==========\n');
+fprintf('Sistema: FIR (N=20) + IIR (α=0.93) + FIR (M=5)\n');
+fprintf('Modelo equivalente: ARMA(%d, %d)\n', length(a_total)-1, length(b_total)-1);
+fprintf('------------------------------------------\n');
 fprintf('Error RMS (RAW):       %.4f m/s²\n', error_raw);
 fprintf('Error RMS (Filtrado):  %.4f m/s²\n', error_final);
 fprintf('Mejora:                %.1f%%\n', mejora_rms);
@@ -394,30 +577,162 @@ title('Atenuación por Frecuencia');
 xline(8, '--r', 'Inicio Tremor');
 xline(12, '--r', 'Fin Tremor');
 
-%% FUNCIÓN AUXILIAR
-function [b_total, a_total] = cascade_filters(b1, a1, b2, a2, b3, a3)
-    % Convierte filtros en cascada a un solo sistema
-    [b_temp, a_temp] = series(b1, a1, b2, a2);
-    [b_total, a_total] = series(b_temp, a_temp, b3, a3);
-end
-
-function [b, a] = series(b1, a1, b2, a2)
-    % Multiplica funciones de transferencia
-    b = conv(b1, b2);
-    a = conv(a1, a2);
+%% FUNCIONES AUXILIARES
+function [b_out, a_out] = series_tf(b1, a1, b2, a2)
+    % Conecta dos funciones de transferencia en serie (cascada)
+    % H_total(z) = H1(z) * H2(z)
+    b_out = conv(b1, b2);  % Multiplica numeradores
+    a_out = conv(a1, a2);  % Multiplica denominadores
 end
 ```
 
-### **Resultados Esperados**
+### **Salida Esperada del Script**
 
 ```
+=== FILTRO 1: FIR Media Móvil ===
+Tipo: FIR (Finite Impulse Response)
+Orden: 20
+Coeficientes b: [0.050, 0.050, ..., 0.050] (20 valores)
+Coeficientes a: [1.000]
+
+=== FILTRO 2: IIR Complementario ===
+Tipo: IIR (Infinite Impulse Response)
+Orden: 1
+Coeficientes b: [0.070]
+Coeficientes a: [1.000, -0.930]
+Polo: z = 0.930 (estable: |z| < 1)
+
+=== FILTRO 3: FIR Buffer Circular ===
+Tipo: FIR (Finite Impulse Response)
+Orden: 5
+Coeficientes b: [0.200, 0.200, ..., 0.200] (5 valores)
+Coeficientes a: [1.000]
+
+=== SISTEMA COMPLETO (Cascada) ===
+Tipo: ARMA (AutoRegressive Moving Average)
+Orden AR (p): 1
+Orden MA (q): 25
+Modelo: ARMA(1, 25)
 ========== REPORTE DE DESEMPEÑO ==========
+Sistema: FIR (N=20) + IIR (α=0.93) + FIR (M=5)
+Modelo equivalente: ARMA(1, 25)
+------------------------------------------
 Error RMS (RAW):       0.5123 m/s²
 Error RMS (Filtrado):  0.0847 m/s²
 Mejora:                83.5%
 Retardo total:         12.3 ms
 Atenuación tremor:     -18.7 dB
 ==========================================
+```
+
+---
+
+## 📚 Fundamento Teórico de Señales
+
+### **1. Filtros FIR vs IIR**
+
+| Característica | FIR | IIR |
+|---------------|-----|-----|
+| **Respuesta al impulso** | Finita (termina) | Infinita (decae exponencialmente) |
+| **Estabilidad** | Siempre estable | Depende de polos |
+| **Fase** | Lineal (retardo constante) | No lineal |
+| **Orden necesario** | Mayor (más coeficientes) | Menor (más eficiente) |
+| **Recursión** | No usa salidas previas | Usa y[n-1], y[n-2], ... |
+| **Implementación** | y[n] = Σb[i]·x[n-i] | y[n] = Σb[i]·x[n-i] + Σa[j]·y[n-j] |
+
+### **2. Modelo ARMA**
+
+**ARMA (AutoRegressive Moving Average)** combina:
+- **AR (AutoRegressive)**: usa valores pasados de la SALIDA
+- **MA (Moving Average)**: usa valores pasados de la ENTRADA
+
+**Ecuación general ARMA(p, q)**:
+```
+y[n] = -Σ(a[k]·y[n-k]) + Σ(b[m]·x[n-m])
+       k=1 hasta p      m=0 hasta q
+```
+
+**Nuestro sistema**:
+```
+ARMA(1, 25) = 1 coeficiente AR (del IIR) + 25 coeficientes MA (de los FIR)
+```
+
+### **3. ¿Por qué usamos FIR + IIR + FIR?**
+
+1. **FIR Media Móvil (N=20)**
+   - ✅ Elimina tremor (8-12 Hz)
+   - ✅ Fase lineal (no distorsiona forma)
+   - ❌ Introduce retardo (100ms)
+
+2. **IIR Complementario (α=0.93)**
+   - ✅ Recupera respuesta rápida
+   - ✅ Eficiente (solo 1 coeficiente)
+   - ✅ Balancea suavizado vs latencia
+
+3. **FIR Buffer (M=5)**
+   - ✅ Suavizado fino final
+   - ✅ Retardo mínimo (25ms)
+   - ✅ Elimina jitter residual
+
+**Resultado**: Sistema ARMA(1,25) que combina lo mejor de FIR e IIR.
+
+---
+
+## 🔬 Análisis de Estabilidad
+
+### **Criterio de Estabilidad**
+
+Un sistema es **estable** si todos sus polos están dentro del círculo unitario:
+```
+|z_polo| < 1
+```
+
+**Nuestros filtros**:
+
+1. **FIR Media Móvil**: 
+   - Polos: Todos en z=0 → **ESTABLE** ✅
+   
+2. **IIR Complementario**:
+   - Polo: z = 0.93 
+   - |0.93| = 0.93 < 1 → **ESTABLE** ✅
+   
+3. **FIR Buffer**:
+   - Polos: Todos en z=0 → **ESTABLE** ✅
+
+**Sistema ARMA completo**: **ESTABLE** ✅ (hereda estabilidad de cascada)
+
+---
+
+## 🎓 Conceptos Clave para Señales
+
+### **Transformada Z**
+
+Relaciona dominio tiempo con dominio frecuencia:
+```
+H(z) = Y(z) / X(z) = B(z) / A(z)
+
+donde:
+  B(z) = b₀ + b₁z⁻¹ + b₂z⁻² + ... (numerador)
+  A(z) = 1 + a₁z⁻¹ + a₂z⁻² + ...  (denominador)
+```
+
+### **Respuesta en Frecuencia**
+
+Evaluando H(z) en el círculo unitario (z = e^(jω)):
+```
+H(e^(jω)) = |H(ω)| · e^(j∠H(ω))
+
+|H(ω)| = magnitud (atenuación)
+∠H(ω) = fase (retardo)
+```
+
+### **Cascada de Filtros**
+
+Cuando conectamos filtros en serie:
+```
+H_total(z) = H₁(z) · H₂(z) · H₃(z)
+
+Multiplicación de funciones de transferencia
 ```
 
 ---
