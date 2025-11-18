@@ -1,0 +1,275 @@
+/*
+ * SPRINT 2 - RECEPTOR (ESP32-S3 en Brazo Robótico) - VERSIÓN FUNCIONAL
+ * Basado en Sprint 1 (que funciona) + Filtros simples
+ * 
+ * MEJORAS vs Sprint 1:
+ * - Recibe datos YA FILTRADOS del transmisor
+ * - Suavizado incremental mejorado (menos tremor)
+ * - MPU del brazo opcional para feedback
+ * 
+ * Hardware: ESP32-S3 + 2 Servos + MPU6500 (opcional)
+ * Comunicación: ESP-NOW broadcast
+ */
+
+#include <esp_now.h>
+#include <WiFi.h>
+#include <ESP32Servo.h>
+#include <Adafruit_MPU6050.h>
+#include <Adafruit_Sensor.h>
+#include <Wire.h>
+
+// ========== CONFIGURACIÓN DE PINES ==========
+#define SERVO1_PIN 6
+#define SERVO2_PIN 7
+#define LED_PIN 48
+#define SDA_PIN 8
+#define SCL_PIN 10
+
+// ========== OBJETOS GLOBALES ==========
+Servo servo1;
+Servo servo2;
+Adafruit_MPU6050 mpuBrazo;
+bool mpuBrazoReady = false;
+
+// ========== ESTRUCTURA ESP-NOW (igual que transmisor) ==========
+typedef struct struct_message {
+  float accelX;
+  float accelY;
+  float accelZ;
+  float gyroX;
+  float gyroY;
+  float gyroZ;
+  unsigned long timestamp;
+  uint8_t handPosition;  // 0=abajo (servo1), 1=arriba (servo2)
+} struct_message;
+
+struct_message receivedData;
+
+// ========== VARIABLES DE CONTROL ==========
+int servo1Position = 90;
+int servo2Position = 90;
+uint8_t activeServo = 1;
+unsigned long lastReceiveTime = 0;
+const unsigned long TIMEOUT = 500;
+
+const float ACCEL_MIN = -4.0;
+const float ACCEL_MAX = 4.0;
+const int SERVO_MIN = 0;
+const int SERVO_MAX = 180;
+
+// ========== CALLBACK ESP-NOW ==========
+void OnDataRecv(const esp_now_recv_info_t *recv_info, const uint8_t *incomingData, int len) {
+  memcpy(&receivedData, incomingData, sizeof(receivedData));
+  lastReceiveTime = millis();
+  activeServo = receivedData.handPosition;
+  digitalWrite(LED_PIN, HIGH);
+  
+  // Los datos YA VIENEN FILTRADOS del transmisor
+  // Mapear accel de -10 a +10 m/s² a 0-180°
+  int targetAngle = map((int)(receivedData.accelX * 10), -100, 100, SERVO_MIN, SERVO_MAX);
+  targetAngle = constrain(targetAngle, SERVO_MIN, SERVO_MAX);
+  
+  // Suavizado adicional: mover hacia el objetivo gradualmente
+  int currentPos = (activeServo == 0) ? servo1Position : servo2Position;
+  int diff = targetAngle - currentPos;
+  
+  // Con datos filtrados, podemos ser más agresivos en el movimiento
+  int step = (abs(diff) > 15) ? 8 : 2;
+  int newPos = currentPos;
+  
+  if (diff > 0) {
+    newPos = min(currentPos + step, targetAngle);
+  } else if (diff < 0) {
+    newPos = max(currentPos - step, targetAngle);
+  }
+  
+  // Aplicar posición al servo activo
+  if (activeServo == 0) {
+    servo1Position = newPos;
+    servo1.write(servo1Position);
+  } else {
+    servo2Position = newPos;
+    servo2.write(servo2Position);
+  }
+  
+  // Debug cada 20 recepciones
+  static int debugCounter = 0;
+  if (debugCounter++ >= 20) {
+    debugCounter = 0;
+    Serial.print("✓ RX FILTRADO | AccelX:");
+    Serial.print(receivedData.accelX, 2);
+    Serial.print(" | Target:");
+    Serial.print(targetAngle);
+    Serial.print("° | Actual:");
+    Serial.print(newPos);
+    Serial.print("° | Mano:");
+    Serial.print(activeServo == 0 ? "ABAJO" : "ARRIBA");
+    Serial.print(" | Servo");
+    Serial.println(activeServo + 1);
+  }
+}
+
+// ========== SETUP ==========
+void setup() {
+  Serial.begin(115200);
+  delay(3000);
+  
+  pinMode(LED_PIN, OUTPUT);
+  
+  // Parpadeo inicial
+  for(int i = 0; i < 10; i++) {
+    digitalWrite(LED_PIN, HIGH);
+    delay(100);
+    digitalWrite(LED_PIN, LOW);
+    delay(100);
+  }
+  
+  Serial.println();
+  Serial.println("========================================");
+  Serial.println("   SPRINT 2 - RECEPTOR");
+  Serial.println("   CON FILTRO DE MEDIA MÓVIL");
+  Serial.println("========================================");
+  Serial.println();
+  Serial.println("LED parpadeó 10 veces - Sistema arrancando...");
+  Serial.println();
+  
+  // WiFi
+  Serial.print("[1/5] WiFi... ");
+  WiFi.mode(WIFI_STA);
+  WiFi.disconnect();
+  delay(100);
+  Serial.println("OK");
+  
+  // Servos
+  Serial.print("[2/5] Servos... ");
+  ESP32PWM::allocateTimer(0);
+  ESP32PWM::allocateTimer(1);
+  servo1.setPeriodHertz(50);
+  servo2.setPeriodHertz(50);
+  servo1.attach(SERVO1_PIN, 500, 2400);
+  servo2.attach(SERVO2_PIN, 500, 2400);
+  servo1.write(90);
+  servo2.write(90);
+  Serial.println("OK (GPIO6, GPIO7)");
+  
+  // Test de servos
+  Serial.print("    Testeando servos... ");
+  servo1.write(45);
+  delay(300);
+  servo1.write(135);
+  delay(300);
+  servo1.write(90);
+  servo2.write(45);
+  delay(300);
+  servo2.write(135);
+  delay(300);
+  servo2.write(90);
+  Serial.println("OK (movieron)");
+  
+  // ESP-NOW
+  Serial.print("[3/5] ESP-NOW... ");
+  if (esp_now_init() != ESP_OK) {
+    Serial.println("ERROR!");
+    while(1) {
+      digitalWrite(LED_PIN, !digitalRead(LED_PIN));
+      delay(200);
+    }
+  }
+  esp_now_register_recv_cb(OnDataRecv);
+  Serial.println("OK");
+  
+  // MPU6500 (OPCIONAL - feedback)
+  Serial.print("[4/5] MPU6500 Brazo (feedback)... ");
+  Wire.begin(SDA_PIN, SCL_PIN);
+  Wire.setClock(100000);
+  delay(100);
+  if (mpuBrazo.begin()) {
+    mpuBrazoReady = true;
+    mpuBrazo.setAccelerometerRange(MPU6050_RANGE_8_G);
+    mpuBrazo.setGyroRange(MPU6050_RANGE_500_DEG);
+    mpuBrazo.setFilterBandwidth(MPU6050_BAND_21_HZ);
+    Serial.println("OK (activo)");
+  } else {
+    mpuBrazoReady = false;
+    Serial.println("NO DETECTADO (continúa sin él)");
+  }
+  
+  // Listo
+  Serial.println("[5/5] Inicialización completa");
+  Serial.println();
+  Serial.println("========================================");
+  Serial.println("   SISTEMA LISTO - FILTRADO ACTIVO");
+  Serial.println("========================================");
+  Serial.println("Datos recibidos YA están filtrados");
+  Serial.println("MPU local: " + String(mpuBrazoReady ? "ACTIVO" : "DESACTIVADO"));
+  Serial.println("Esperando datos del Transmisor...");
+  Serial.println();
+  
+  // Parpadeo de confirmación
+  for(int i=0; i<3; i++) {
+    digitalWrite(LED_PIN, HIGH);
+    delay(300);
+    digitalWrite(LED_PIN, LOW);
+    delay(300);
+  }
+}
+
+// ========== LOOP ==========
+void loop() {
+  static unsigned long lastPrint = 0;
+  static unsigned long lastFeedback = 0;
+  static int counter = 0;
+  
+  // Apagar LED
+  if (millis() - lastReceiveTime > 50) {
+    digitalWrite(LED_PIN, LOW);
+  }
+  
+  // Contador si no hay datos
+  if (millis() - lastPrint >= 1000) {
+    lastPrint = millis();
+    
+    if (lastReceiveTime == 0 || (millis() - lastReceiveTime >= TIMEOUT)) {
+      Serial.print("[");
+      Serial.print(counter++);
+      Serial.println("] Esperando datos...");
+    }
+  }
+  
+  // Feedback del MPU local (cada 2 segundos)
+  if (mpuBrazoReady && (millis() - lastFeedback >= 2000)) {
+    lastFeedback = millis();
+    
+    sensors_event_t accel, gyro, temp;
+    mpuBrazo.getEvent(&accel, &gyro, &temp);
+    
+    Serial.println("\n--- FEEDBACK MPU BRAZO ---");
+    Serial.print("Posición Real | X:");
+    Serial.print(accel.acceleration.x, 2);
+    Serial.print(" Y:");
+    Serial.print(accel.acceleration.y, 2);
+    Serial.print(" Z:");
+    Serial.print(accel.acceleration.z, 2);
+    Serial.println(" m/s²");
+    Serial.print("Servos | S1:");
+    Serial.print(servo1Position);
+    Serial.print("° S2:");
+    Serial.print(servo2Position);
+    Serial.println("°\n");
+  }
+  
+  // Timeout - volver a centro
+  if (lastReceiveTime > 0 && (millis() - lastReceiveTime > TIMEOUT)) {
+    if (servo1Position != 90) {
+      servo1Position += (servo1Position < 90) ? 1 : -1;
+      servo1.write(servo1Position);
+    }
+    if (servo2Position != 90) {
+      servo2Position += (servo2Position < 90) ? 1 : -1;
+      servo2.write(servo2Position);
+    }
+    delay(20);
+  }
+  
+  delay(10);
+}
