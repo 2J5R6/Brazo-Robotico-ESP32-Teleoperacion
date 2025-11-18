@@ -635,12 +635,12 @@ Cada sprint sigue esta estructura:
 ---
 
 ## 📞 Información de Contacto
-[text](https://www.linkedin.com/in/envision-juli%C3%A1n-andr%C3%A9s-rosas-s%C3%A1nchez-creating/)
+[LinkedIn](https://www.linkedin.com/in/envision-juli%C3%A1n-andr%C3%A9s-rosas-s%C3%A1nchez-creating/)
 
-### Equipo de Trabajo
+### Desarrolador
 - Julian Andres Rosas Sanchez
+- Ingeniería Mecatrónica
 
-- Laboratorio de Señales
 - Universidad Militar Nueva Granada
 
 ---
