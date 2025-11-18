@@ -31,7 +31,7 @@
 #define SDA_PIN 4
 #define SCL_PIN 5
 
-#define FIR_WINDOW 10           // Pre-filtro FIR
+#define FIR_WINDOW 5            // Pre-filtro FIR (reducido para velocidad)
 #define TRANSMIT_HZ 100         // 100 Hz
 const int TRANSMIT_INTERVAL = 1000 / TRANSMIT_HZ;
 
@@ -151,9 +151,9 @@ const float dt = 0.01;  // 100Hz = 10ms = 0.01s
 // Esto evita lecturas intermedias confusas durante el giro físico
 static bool force_vertical_reading = false;
 static unsigned long force_start_time = 0;
-const unsigned long FORCE_DURATION = 500;     // Forzar lectura vertical 500ms
-const float REST_ACCEL_Y_MIN = -0.8;         // Rango de reposo en Y
-const float REST_ACCEL_Y_MAX = 0.8;          // (mano horizontal quieta)
+const unsigned long FORCE_DURATION = 350;     // Forzar lectura vertical 350ms (optimizado)
+const float REST_ACCEL_Y_MIN = -0.6;         // Rango de reposo en Y (más preciso)
+const float REST_ACCEL_Y_MAX = 0.6;          // (mano horizontal quieta)
 
 // ========== CALLBACK ESP-NOW ==========
 void OnDataSent(const wifi_tx_info_t *mac_addr, esp_now_send_status_t status) {
@@ -312,25 +312,30 @@ void loop() {
     float gyroY_fir = firGyroY.update(g.gyro.y);
     float gyroZ_fir = firGyroZ.update(g.gyro.z);
     
+    // DETECCIÓN DE ORIENTACIÓN PRELIMINAR (para saber modo actual)
+    float absZ_prelim = abs(accelZ_fir);
+    uint8_t current_orientation = (absZ_prelim > 5.0) ? 0 : 1;  // 0=VERTICAL, 1=HORIZONTAL
+    
     // DETECCIÓN DE REPOSO: Si AccelY ≈ 0, mano está horizontal quieta
-    // Probablemente viene un GIRO, así que FORZAR lectura vertical
+    // SOLO FORZAR si el modo actual es HORIZONTAL (Servo2)
     bool in_rest = (accelY_fir >= REST_ACCEL_Y_MIN && accelY_fir <= REST_ACCEL_Y_MAX);
     
-    // Activar FORZADO cuando detectamos reposo
-    if (in_rest && !force_vertical_reading) {
+    // Activar FORZADO cuando detectamos reposo Y estamos en modo HORIZONTAL
+    if (in_rest && current_orientation == 1 && !force_vertical_reading) {
       force_vertical_reading = true;
       force_start_time = now;
     }
     
-    // Desactivar FORZADO después de 500ms
+    // Desactivar FORZADO después de 350ms
     if (force_vertical_reading && (now - force_start_time >= FORCE_DURATION)) {
       force_vertical_reading = false;
     }
     
-    // ⭐ FORZAR accelZ = 9.0 (VERTICAL) cuando está en reposo
-    // Esto hace que el sistema NO vea valores intermedios durante el giro
+    // ⭐ FORZAR accelZ = 9.0 (VERTICAL) cuando está en reposo Y modo es HORIZONTAL
+    // Esto previene falsa detección horizontal durante giro H→V
+    // NO se activa en modo VERTICAL (evita movimiento no deseado de Servo1)
     if (force_vertical_reading) {
-      accelZ_fir = 9.0;  // FORZAR VERTICAL (tu solución original!)
+      accelZ_fir = 9.0;  // FORZAR VERTICAL solo durante transición H→V
     }
     
     // 2. FILTRO DE KALMAN (fusión accel + gyro)
@@ -347,11 +352,11 @@ void loop() {
     float pitch_kalman = kalmanPitch.update(gyroY_fir, accel_pitch, dt);
     float roll_kalman = kalmanRoll.update(gyroX_fir, accel_roll, dt);
     
-    // 3. SUAVIZADO IIR FINAL (α=0.95)
+    // 3. SUAVIZADO IIR FINAL (α=0.90 - optimizado para velocidad)
     static float pitch_smooth = 0;
     static float roll_smooth = 0;
-    pitch_smooth = 0.95 * pitch_smooth + 0.05 * pitch_kalman;
-    roll_smooth = 0.95 * roll_smooth + 0.05 * roll_kalman;
+    pitch_smooth = 0.90 * pitch_smooth + 0.10 * pitch_kalman;
+    roll_smooth = 0.90 * roll_smooth + 0.10 * roll_kalman;
     
     // Preparar datos para transmisión
     sensorData.accelX_filtered = accelX_fir;
@@ -368,14 +373,14 @@ void loop() {
     // Detección de orientación con BLOQUEO INTELIGENTE
     float absZ = abs(accelZ_fir);  // Valores reales del sensor, sin manipular
     
-    // Filtro promedio sobre AccelZ (15 muestras para suavizar)
-    static float accelZ_history[15] = {9.0, 9.0, 9.0, 9.0, 9.0, 9.0, 9.0, 9.0, 9.0, 9.0, 9.0, 9.0, 9.0, 9.0, 9.0};  // Inicializar en vertical
+    // Filtro promedio sobre AccelZ (8 muestras para respuesta rápida)
+    static float accelZ_history[8] = {9.0, 9.0, 9.0, 9.0, 9.0, 9.0, 9.0, 9.0};  // Inicializar en vertical
     static int z_idx = 0;
     accelZ_history[z_idx] = absZ;
-    z_idx = (z_idx + 1) % 15;
+    z_idx = (z_idx + 1) % 8;
     float absZ_avg = 0;
-    for(int i = 0; i < 15; i++) absZ_avg += accelZ_history[i];
-    absZ_avg /= 15.0;
+    for(int i = 0; i < 8; i++) absZ_avg += accelZ_history[i];
+    absZ_avg /= 8.0;
     
     static uint8_t lastPos = 0;  // INICIA VERTICAL (0=vertical, 1=horizontal)
     static int stability_counter = 0;
@@ -391,15 +396,15 @@ void loop() {
     
     // No hay bloqueo adicional - el forzado de accelZ_fir ya previene detección falsa
     
-    // Requerir 15 lecturas para VERTICAL→HORIZONTAL, 5 para HORIZONTAL→VERTICAL
-    int required_count = 5;  // Por defecto rápido
+    // Requerir 8 lecturas para VERTICAL→HORIZONTAL, 3 para HORIZONTAL→VERTICAL
+    int required_count = 3;  // Por defecto rápido
     
     if (lastPos == 0 && newPos == 1) {
-      // VERTICAL → HORIZONTAL: conservador (15 lecturas = 0.15s)
-      required_count = 15;
+      // VERTICAL → HORIZONTAL: conservador (8 lecturas = 0.08s)
+      required_count = 8;
     } else if (lastPos == 1 && newPos == 0) {
-      // HORIZONTAL → VERTICAL: rápido (5 lecturas = 0.05s)
-      required_count = 5;
+      // HORIZONTAL → VERTICAL: rápido (3 lecturas = 0.03s)
+      required_count = 3;
     }
     
     // Contador de estabilidad

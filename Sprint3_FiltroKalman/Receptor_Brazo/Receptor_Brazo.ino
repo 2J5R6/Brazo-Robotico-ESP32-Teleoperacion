@@ -62,8 +62,8 @@ public:
   }
 };
 
-IIRFilter iirServo1(0.85);  // Suavizado adicional
-IIRFilter iirServo2(0.95);  // Servo2 ultra-agresivo (elimina tremor accel)
+IIRFilter iirServo1(0.80);  // Suavizado ágil (optimizado)
+IIRFilter iirServo2(0.92);  // Servo2 agresivo (anti-tremor pero rápido)
 
 // Variables de control
 float servo1Current = 90.0;
@@ -79,9 +79,9 @@ unsigned long lastReceiveTime = 0;
 unsigned long lastUpdate = 0;
 bool inTransition = false;
 const unsigned long TIMEOUT = 500;
-const unsigned long STILLNESS_TIME = 1000;  // 1 segundo quieto para cambiar modo
+const unsigned long STILLNESS_TIME = 800;  // 0.8s quieto para cambiar modo (optimizado)
 const float UPDATE_INTERVAL = 5;  // 200Hz
-const float DEADZONE_SERVO2 = 0.3;  // Zona muerta ±0.3 m/s²
+const float DEADZONE_SERVO2 = 0.2;  // Zona muerta ±0.2 m/s² (más sensible)
 const float MOVEMENT_THRESHOLD = 5.0;  // Umbral para detectar movimiento (grados)
 
 const int SERVO_MIN = 10;
@@ -158,13 +158,12 @@ void OnDataRecv(const esp_now_recv_info_t *recv_info, const uint8_t *incomingDat
       sensorValue = 0;  // Forzar a cero en zona muerta
     }
     
-    // Buffer de 5 muestras para estabilización adicional (era 3)
-    static float accelY_buffer[5] = {0, 0, 0, 0, 0};
+    // Buffer de 3 muestras para estabilización (optimizado para velocidad)
+    static float accelY_buffer[3] = {0, 0, 0};
     static int buffer_idx = 0;
     accelY_buffer[buffer_idx] = sensorValue;
-    buffer_idx = (buffer_idx + 1) % 5;
-    float accelY_avg = (accelY_buffer[0] + accelY_buffer[1] + accelY_buffer[2] + 
-                        accelY_buffer[3] + accelY_buffer[4]) / 5.0;
+    buffer_idx = (buffer_idx + 1) % 3;
+    float accelY_avg = (accelY_buffer[0] + accelY_buffer[1] + accelY_buffer[2]) / 3.0;
     
     mappedAngle = map(accelY_avg * 100, 250, -250, SERVO_MIN, SERVO_MAX);
     mappedAngle = constrain(mappedAngle, SERVO_MIN, SERVO_MAX);
