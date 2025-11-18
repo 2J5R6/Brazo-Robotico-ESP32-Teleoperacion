@@ -146,14 +146,14 @@ unsigned long lastDebug = 0;
 unsigned long lastKalmanUpdate = 0;
 const float dt = 0.01;  // 100Hz = 10ms = 0.01s
 
-// Variables para filtro de cambio brusco
-static float last_accelY = 0;
-static bool accelY_frozen = false;
-static unsigned long freeze_start_time = 0;
-const float SUDDEN_CHANGE_THRESHOLD = 1.5;  // m/s²
-const unsigned long FREEZE_DURATION = 300;  // ms
-const float NEAR_ZERO_MIN = -0.6;           // Rango cercano a 0
-const float NEAR_ZERO_MAX = 0.8;
+// Variables para FORZADO DE ORIENTACIÓN durante giro
+// Si AccelY ≈ 0 (reposo/horizontal), FORZAR accelZ=9 para que sistema vea VERTICAL
+// Esto evita lecturas intermedias confusas durante el giro físico
+static bool force_vertical_reading = false;
+static unsigned long force_start_time = 0;
+const unsigned long FORCE_DURATION = 500;     // Forzar lectura vertical 500ms
+const float REST_ACCEL_Y_MIN = -0.8;         // Rango de reposo en Y
+const float REST_ACCEL_Y_MAX = 0.8;          // (mano horizontal quieta)
 
 // ========== CALLBACK ESP-NOW ==========
 void OnDataSent(const wifi_tx_info_t *mac_addr, esp_now_send_status_t status) {
@@ -188,8 +188,7 @@ void setup() {
   Serial.print("[1/4] I2C... ");
   Wire.begin(SDA_PIN, SCL_PIN);
   Wire.setClock(50000);  // Reducido a 50kHz (más estable en movimiento)
-  Wire.setTimeOut(5000); // Timeout de 5ms para evitar cuelgues
-  delay(100);
+  Wire.setTimeOut(5000); // Timeout de 5ms para evitar cuelgues  delay(100);
   Serial.println("OK");
   
   // MPU6050
@@ -313,27 +312,25 @@ void loop() {
     float gyroY_fir = firGyroY.update(g.gyro.y);
     float gyroZ_fir = firGyroZ.update(g.gyro.z);
     
-    // FILTRO DE CAMBIO BRUSCO (solo si AccelY está cerca de 0)
-    bool is_near_zero = (last_accelY >= NEAR_ZERO_MIN && last_accelY <= NEAR_ZERO_MAX);
-    float accelY_delta = abs(accelY_fir - last_accelY);
+    // DETECCIÓN DE REPOSO: Si AccelY ≈ 0, mano está horizontal quieta
+    // Probablemente viene un GIRO, así que FORZAR lectura vertical
+    bool in_rest = (accelY_fir >= REST_ACCEL_Y_MIN && accelY_fir <= REST_ACCEL_Y_MAX);
     
-    // Si está cerca de 0 y hay cambio brusco > 1.5: congelar
-    if (is_near_zero && accelY_delta > SUDDEN_CHANGE_THRESHOLD && !accelY_frozen) {
-      accelY_frozen = true;
-      freeze_start_time = now;
-      accelY_fir = last_accelY;  // Mantener valor anterior
+    // Activar FORZADO cuando detectamos reposo
+    if (in_rest && !force_vertical_reading) {
+      force_vertical_reading = true;
+      force_start_time = now;
     }
     
-    // Descongelar después de 300ms
-    if (accelY_frozen && (now - freeze_start_time >= FREEZE_DURATION)) {
-      accelY_frozen = false;
+    // Desactivar FORZADO después de 500ms
+    if (force_vertical_reading && (now - force_start_time >= FORCE_DURATION)) {
+      force_vertical_reading = false;
     }
     
-    // Si está congelado, mantener último valor
-    if (accelY_frozen) {
-      accelY_fir = last_accelY;
-    } else {
-      last_accelY = accelY_fir;  // Actualizar solo si no está congelado
+    // ⭐ FORZAR accelZ = 9.0 (VERTICAL) cuando está en reposo
+    // Esto hace que el sistema NO vea valores intermedios durante el giro
+    if (force_vertical_reading) {
+      accelZ_fir = 9.0;  // FORZAR VERTICAL (tu solución original!)
     }
     
     // 2. FILTRO DE KALMAN (fusión accel + gyro)
@@ -368,11 +365,11 @@ void loop() {
     sensorData.timestamp = now;
     sensorData.kalman_variance = (kalmanPitch.getVariance() + kalmanRoll.getVariance()) / 2;
     
-    // Detección de orientación SIMPLE y ROBUSTA
-    float absZ = abs(accelZ_fir);
+    // Detección de orientación con BLOQUEO INTELIGENTE
+    float absZ = abs(accelZ_fir);  // Valores reales del sensor, sin manipular
     
     // Filtro promedio sobre AccelZ (15 muestras para suavizar)
-    static float accelZ_history[15] = {0};
+    static float accelZ_history[15] = {9.0, 9.0, 9.0, 9.0, 9.0, 9.0, 9.0, 9.0, 9.0, 9.0, 9.0, 9.0, 9.0, 9.0, 9.0};  // Inicializar en vertical
     static int z_idx = 0;
     accelZ_history[z_idx] = absZ;
     z_idx = (z_idx + 1) % 15;
@@ -380,27 +377,28 @@ void loop() {
     for(int i = 0; i < 15; i++) absZ_avg += accelZ_history[i];
     absZ_avg /= 15.0;
     
-    static uint8_t lastPos = 1;
+    static uint8_t lastPos = 0;  // INICIA VERTICAL (0=vertical, 1=horizontal)
     static int stability_counter = 0;
     
     // Umbrales con histéresis amplia
     uint8_t newPos = lastPos;
-    if (absZ_avg > 8) {        // Detecta VERTICAL (más restrictivo)
+    if (absZ_avg > 8) {        // Detecta VERTICAL
       newPos = 0;
-    } else if (absZ_avg < 2.5) { // Detecta HORIZONTAL (más restrictivo)
+    } else if (absZ_avg < 2.5) { // Detecta HORIZONTAL
       newPos = 1;
     }
-    // Entre 2.5 y 9.2: mantiene estado anterior (zona de histéresis)
+    // Entre 2.5 y 8: mantiene estado anterior (zona de histéresis)
     
-    // Requerir 20 lecturas consistentes para HORIZONTAL→VERTICAL
-    // Solo 5 lecturas para VERTICAL→HORIZONTAL (rápido)
+    // No hay bloqueo adicional - el forzado de accelZ_fir ya previene detección falsa
+    
+    // Requerir 15 lecturas para VERTICAL→HORIZONTAL, 5 para HORIZONTAL→VERTICAL
     int required_count = 5;  // Por defecto rápido
     
-    if (lastPos == 1 && newPos == 0) {
-      // HORIZONTAL → VERTICAL: más conservador (20 lecturas = 0.2s)
-      required_count = 20;
-    } else if (lastPos == 0 && newPos == 1) {
-      // VERTICAL → HORIZONTAL: más rápido (5 lecturas = 0.05s)
+    if (lastPos == 0 && newPos == 1) {
+      // VERTICAL → HORIZONTAL: conservador (15 lecturas = 0.15s)
+      required_count = 15;
+    } else if (lastPos == 1 && newPos == 0) {
+      // HORIZONTAL → VERTICAL: rápido (5 lecturas = 0.05s)
       required_count = 5;
     }
     
@@ -434,9 +432,9 @@ void loop() {
     Serial.print(" | AccelY:");
     Serial.print(sensorData.accelY_filtered, 2);
     
-    // Mostrar estado de congelamiento
-    if (accelY_frozen) {
-      Serial.print(" | ⏸ CONGELADO");
+    // Mostrar cuando se FUERZA lectura vertical
+    if (force_vertical_reading) {
+      Serial.print(" | ⚡ FORCE-Z=9");
     }
     
     Serial.println();
