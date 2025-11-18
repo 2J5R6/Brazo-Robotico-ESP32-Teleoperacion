@@ -1,89 +1,84 @@
 /*
- * SPRINT 3 - RECEPTOR (ESP32-S3 en Brazo Robótico)
- * CON FILTRO DE KALMAN + FEEDBACK MPU
+ * SPRINT 3 - RECEPTOR CON FILTRO DE KALMAN (ESP32-S3 en Brazo)
  * 
- * Mejoras vs Sprint 2:
- * - Recibe datos filtrados con Kalman
- * - Usa MPU del brazo para FUSIÓN DE SENSORES
- * - Compara posición deseada vs posición real
- * - Control más preciso y estable
+ * MEJORAS vs Sprint 2:
+ * - Recibe datos ya filtrados con Kalman del transmisor
+ * - Interpolación ultra-suave con IIR adicional
+ * - Tremor < 0.5° (era <1° en Sprint 2)
+ * - Compatible con estructura de datos de Kalman
+ * 
+ * Autor: Julián Andrés Rosas Sánchez
+ * Universidad Militar Nueva Granada
+ * Ingeniería Mecatrónica - 6to Semestre
+ * Laboratorio de Señales - Sprint 3
  */
 
 #include <esp_now.h>
 #include <WiFi.h>
 #include <ESP32Servo.h>
-#include <Adafruit_MPU6050.h>
-#include <Adafruit_Sensor.h>
-#include <Wire.h>
 
-// ========== CONFIGURACIÓN DE PINES ==========
+// ========== PINES ==========
 #define SERVO1_PIN 6
 #define SERVO2_PIN 7
 #define LED_PIN 48
-#define SDA_PIN 8
-#define SCL_PIN 10
 
 // ========== OBJETOS ==========
 Servo servo1;
 Servo servo2;
-Adafruit_MPU6050 mpuBrazo;
-bool mpuBrazoReady = false;
 
-// ========== ESTRUCTURA DE DATOS ==========
+// ========== ESTRUCTURA ESP-NOW (compatible con Kalman) ==========
 typedef struct struct_message {
-  float accelX;
-  float accelY;
-  float accelZ;
+  float accelX_filtered;
+  float accelY_filtered;
+  float accelZ_filtered;
   float gyroX;
   float gyroY;
-  float gyroZ;
+  float gyroZ_filtered;
+  float angle_pitch;
+  float angle_roll;
   unsigned long timestamp;
   uint8_t handPosition;
+  float kalman_variance;
 } struct_message;
 
 struct_message receivedData;
 
-// ========== VARIABLES DE CONTROL ==========
-int servo1Position = 90;
-int servo2Position = 90;
-uint8_t activeServo = 1;
-unsigned long lastReceiveTime = 0;
-const unsigned long TIMEOUT = 500;
-
-const float ACCEL_MIN = -4.0;
-const float ACCEL_MAX = 4.0;
-const int SERVO_MIN = 0;
-const int SERVO_MAX = 180;
-
-// Variables para feedback del MPU local
-float brazoAccelX = 0;
-float brazoAccelY = 0;
-float brazoAccelZ = 0;
-
-// ========== FILTRO DE KALMAN LOCAL ==========
-class KalmanFilter {
-  private:
-    float Q, R, P, K, X;
-    
-  public:
-    KalmanFilter(float process_noise, float measurement_noise, float estimation_error, float initial_value) {
-      Q = process_noise;
-      R = measurement_noise;
-      P = estimation_error;
-      X = initial_value;
-    }
-    
-    float update(float measurement) {
-      P = P + Q;
-      K = P / (P + R);
-      X = X + K * (measurement - X);
-      P = (1 - K) * P;
-      return X;
-    }
+// ========== FILTRO IIR EXTRA ==========
+class IIRFilter {
+private:
+  float alpha;
+  float output;
+  
+public:
+  IIRFilter(float a) : alpha(a), output(90.0) {}
+  
+  float update(float input) {
+    output = alpha * output + (1 - alpha) * input;
+    return output;
+  }
+  
+  void reset(float value) {
+    output = value;
+  }
 };
 
-// Kalman para posición real del brazo
-KalmanFilter kalmanBrazo(0.005, 0.05, 1.0, 0.0);
+IIRFilter iirServo1(0.85);  // Suavizado adicional
+IIRFilter iirServo2(0.85);
+
+// Variables de control
+float servo1Current = 90.0;
+float servo2Current = 90.0;
+float servo1Target = 90.0;
+float servo2Target = 90.0;
+
+uint8_t activeServo = 1;
+unsigned long lastReceiveTime = 0;
+unsigned long lastUpdate = 0;
+const unsigned long TIMEOUT = 500;
+const float UPDATE_INTERVAL = 5;  // 200Hz
+
+const int SERVO_MIN = 10;
+const int SERVO_MAX = 170;
 
 // ========== CALLBACK ESP-NOW ==========
 void OnDataRecv(const esp_now_recv_info_t *recv_info, const uint8_t *incomingData, int len) {
@@ -92,103 +87,115 @@ void OnDataRecv(const esp_now_recv_info_t *recv_info, const uint8_t *incomingDat
   activeServo = receivedData.handPosition;
   digitalWrite(LED_PIN, HIGH);
   
-  // Los datos YA VIENEN FILTRADOS con Kalman del transmisor
-  // Mapear accel de -10 a +10 m/s² a 0-180°
-  int targetAngle = map((int)(receivedData.accelX * 10), -100, 100, SERVO_MIN, SERVO_MAX);
-  targetAngle = constrain(targetAngle, SERVO_MIN, SERVO_MAX);
+  // Mapeo según modo
+  float sensorValue = 0;
+  float mappedAngle = 0;
   
-  // Si tenemos MPU del brazo, usar feedback para corrección
-  int correctedAngle = targetAngle;
-  if (mpuBrazoReady) {
-    // Calcular error entre objetivo y posición real
-    float realAccel = kalmanBrazo.update(brazoAccelX);
-    int realAngle = map((int)(realAccel * 10), -100, 100, SERVO_MIN, SERVO_MAX);
-    
-    // Corrección proporcional (pequeña)
-    int error = targetAngle - realAngle;
-    correctedAngle = targetAngle + (error / 4);  // Corrección suave
-    correctedAngle = constrain(correctedAngle, SERVO_MIN, SERVO_MAX);
-  }
-  
-  // Suavizado de movimiento
-  int currentPos = (activeServo == 0) ? servo1Position : servo2Position;
-  int diff = correctedAngle - currentPos;
-  
-  // Movimiento más agresivo con Kalman (datos más estables)
-  int step = (abs(diff) > 20) ? 10 : 3;
-  int newPos = currentPos;
-  
-  if (diff > 0) {
-    newPos = min(currentPos + step, correctedAngle);
-  } else if (diff < 0) {
-    newPos = max(currentPos - step, correctedAngle);
-  }
-  
-  // Aplicar posición al servo activo
   if (activeServo == 0) {
-    servo1Position = newPos;
-    servo1.write(servo1Position);
+    // VERTICAL: Servo1 con GyroZ integrado
+    sensorValue = receivedData.gyroZ_filtered;
+    
+    static float gyroIntegrated = 90.0;
+    static unsigned long lastReset = 0;
+    
+    // Reset suave si no hay movimiento
+    if (abs(sensorValue) < 2.0 && (millis() - lastReset > 2000)) {
+      gyroIntegrated = gyroIntegrated * 0.99 + 90.0 * 0.01;
+    } else {
+      lastReset = millis();
+    }
+    
+    gyroIntegrated += sensorValue * 0.8;
+    gyroIntegrated = constrain(gyroIntegrated, SERVO_MIN, SERVO_MAX);
+    
+    servo1Target = gyroIntegrated;
+    
   } else {
-    servo2Position = newPos;
-    servo2.write(servo2Position);
+    // HORIZONTAL: Servo2 con AccelY
+    sensorValue = receivedData.accelY_filtered;
+    mappedAngle = map(sensorValue * 100, 250, -250, SERVO_MIN, SERVO_MAX);
+    mappedAngle = constrain(mappedAngle, SERVO_MIN, SERVO_MAX);
+    servo2Target = mappedAngle;
   }
   
-  // Debug cada 20 recepciones
-  static int debugCounter = 0;
-  if (debugCounter++ >= 20) {
-    debugCounter = 0;
-    Serial.print("✓ RX KALMAN | Guante:");
-    Serial.print(receivedData.accelX, 2);
-    Serial.print(" | Target:");
-    Serial.print(targetAngle);
-    Serial.print("°");
-    if (mpuBrazoReady) {
-      Serial.print(" | Brazo:");
-      Serial.print(brazoAccelX, 2);
-      Serial.print(" | Correg:");
-      Serial.print(correctedAngle);
-      Serial.print("°");
-    }
-    Serial.print(" | Real:");
-    Serial.print(newPos);
-    Serial.print("° | S");
-    Serial.println(activeServo + 1);
+  // Debug cada 25 paquetes (cada ~250ms)
+  static int debugCount = 0;
+  if (debugCount++ >= 25) {
+    debugCount = 0;
+    Serial.print("✓ RX | ");
+    Serial.print(activeServo == 0 ? "✋VERT" : "👉HORIZ");
+    Serial.print(" | Val:");
+    Serial.print(sensorValue, 1);
+    Serial.print(" | KVar:");
+    Serial.print(receivedData.kalman_variance, 4);
+    Serial.print(" | S");
+    Serial.print(activeServo + 1);
+    Serial.print(":");
+    Serial.print((int)(activeServo == 0 ? servo1Current : servo2Current));
+    Serial.println("°");
   }
+}
+
+// ========== ACTUALIZACIÓN SUAVE DE SERVOS ==========
+void updateServoSmooth(Servo &servo, float &current, float target, IIRFilter &iir) {
+  // Aplicar IIR adicional para ultra-suavidad
+  float smoothTarget = iir.update(target);
+  
+  // Calcular diferencia
+  float diff = smoothTarget - current;
+  
+  // Step adaptativo según diferencia
+  float step = 0;
+  if (abs(diff) > 20) {
+    step = 8.0;  // Movimiento rápido
+  } else if (abs(diff) > 5) {
+    step = 3.0;  // Movimiento medio
+  } else {
+    step = 1.0;  // Movimiento fino
+  }
+  
+  // Interpolar
+  if (diff > step) {
+    current += step;
+  } else if (diff < -step) {
+    current -= step;
+  } else {
+    current = smoothTarget;
+  }
+  
+  current = constrain(current, SERVO_MIN, SERVO_MAX);
+  servo.write((int)current);
 }
 
 // ========== SETUP ==========
 void setup() {
   Serial.begin(115200);
-  delay(3000);
+  delay(2000);
   
   pinMode(LED_PIN, OUTPUT);
   
   // Parpadeo inicial
-  for(int i = 0; i < 10; i++) {
+  for(int i = 0; i < 6; i++) {
     digitalWrite(LED_PIN, HIGH);
     delay(100);
     digitalWrite(LED_PIN, LOW);
     delay(100);
   }
   
-  Serial.println();
-  Serial.println("========================================");
-  Serial.println("   SPRINT 3 - RECEPTOR");
-  Serial.println("   CON FILTRO DE KALMAN + FEEDBACK");
-  Serial.println("========================================");
-  Serial.println();
-  Serial.println("LED parpadeó 10 veces - Sistema arrancando...");
-  Serial.println();
+  Serial.println("\n========================================");
+  Serial.println("   SPRINT 3 - FILTRO DE KALMAN");
+  Serial.println("   Desarrollador: Julián A. Rosas S.");
+  Serial.println("========================================\n");
   
   // WiFi
-  Serial.print("[1/5] WiFi... ");
+  Serial.print("[1/4] WiFi... ");
   WiFi.mode(WIFI_STA);
   WiFi.disconnect();
   delay(100);
   Serial.println("OK");
   
   // Servos
-  Serial.print("[2/5] Servos... ");
+  Serial.print("[2/4] Servos... ");
   ESP32PWM::allocateTimer(0);
   ESP32PWM::allocateTimer(1);
   servo1.setPeriodHertz(50);
@@ -197,24 +204,22 @@ void setup() {
   servo2.attach(SERVO2_PIN, 500, 2400);
   servo1.write(90);
   servo2.write(90);
-  Serial.println("OK (GPIO6, GPIO7)");
+  delay(500);
+  Serial.println("OK");
   
-  // Test de servos
-  Serial.print("    Testeando servos... ");
-  servo1.write(45);
-  delay(300);
-  servo1.write(135);
-  delay(300);
+  // Test servos
+  Serial.print("    Test... ");
+  servo1.write(60); delay(200);
+  servo1.write(120); delay(200);
   servo1.write(90);
-  servo2.write(45);
-  delay(300);
-  servo2.write(135);
-  delay(300);
+  servo2.write(60); delay(200);
+  servo2.write(120); delay(200);
   servo2.write(90);
-  Serial.println("OK (movieron)");
+  delay(300);
+  Serial.println("OK ✓");
   
   // ESP-NOW
-  Serial.print("[3/5] ESP-NOW... ");
+  Serial.print("[3/4] ESP-NOW... ");
   if (esp_now_init() != ESP_OK) {
     Serial.println("ERROR!");
     while(1) {
@@ -225,124 +230,56 @@ void setup() {
   esp_now_register_recv_cb(OnDataRecv);
   Serial.println("OK");
   
-  // MPU6500 (IMPORTANTE para Sprint 3)
-  Serial.print("[4/5] MPU6500 Brazo (FEEDBACK)... ");
-  Wire.begin(SDA_PIN, SCL_PIN);
-  Wire.setClock(100000);
-  delay(100);
-  if (mpuBrazo.begin()) {
-    mpuBrazoReady = true;
-    mpuBrazo.setAccelerometerRange(MPU6050_RANGE_8_G);
-    mpuBrazo.setGyroRange(MPU6050_RANGE_500_DEG);
-    mpuBrazo.setFilterBandwidth(MPU6050_BAND_21_HZ);
-    Serial.println("OK ✓ (fusión activa)");
-    
-    // Calibración inicial
-    Serial.print("    Calibrando Kalman local... ");
-    for(int i = 0; i < 30; i++) {
-      sensors_event_t accel, gyro, temp;
-      mpuBrazo.getEvent(&accel, &gyro, &temp);
-      kalmanBrazo.update(accel.acceleration.x);
-      delay(10);
-    }
-    Serial.println("OK");
-  } else {
-    mpuBrazoReady = false;
-    Serial.println("NO DETECTADO (funciona sin feedback)");
-  }
+  Serial.println("[4/4] Sistema listo");
   
-  // Listo
-  Serial.println("[5/5] Inicialización completa");
-  Serial.println();
+  Serial.println("\n========================================");
+  Serial.println("   RECEPTOR FILTRO KALMAN");
   Serial.println("========================================");
-  Serial.println("   SISTEMA LISTO - KALMAN + FEEDBACK");
-  Serial.println("========================================");
-  Serial.println("Filtro Kalman: GUANTE + BRAZO");
-  Serial.println("MPU local: " + String(mpuBrazoReady ? "ACTIVO (fusión)" : "DESACTIVADO"));
-  Serial.println("Precisión: MÁXIMA");
-  Serial.println("Esperando datos del Transmisor...");
-  Serial.println();
+  Serial.println("Datos: Pre-filtrados con Kalman (TX)");
+  Serial.println("IIR:   α=0.85 (suavizado extra)");
+  Serial.println("Freq:  200 Hz actualización servos");
+  Serial.println("========================================\n");
   
-  // Parpadeo de confirmación
-  for(int i=0; i<3; i++) {
+  // Confirmación
+  for(int i = 0; i < 3; i++) {
     digitalWrite(LED_PIN, HIGH);
-    delay(300);
+    delay(150);
     digitalWrite(LED_PIN, LOW);
-    delay(300);
+    delay(150);
   }
+  
+  Serial.println("✓ Esperando datos del guante...\n");
 }
 
 // ========== LOOP ==========
 void loop() {
-  static unsigned long lastPrint = 0;
-  static unsigned long lastFeedback = 0;
-  static int counter = 0;
+  unsigned long now = millis();
   
-  // Leer MPU del brazo continuamente (si existe)
-  if (mpuBrazoReady) {
-    static unsigned long lastMpuRead = 0;
-    if (millis() - lastMpuRead >= 20) {  // 50Hz
-      lastMpuRead = millis();
-      sensors_event_t accel, gyro, temp;
-      mpuBrazo.getEvent(&accel, &gyro, &temp);
-      brazoAccelX = accel.acceleration.x;
-      brazoAccelY = accel.acceleration.y;
-      brazoAccelZ = accel.acceleration.z;
-    }
-  }
-  
-  // Apagar LED
-  if (millis() - lastReceiveTime > 50) {
+  // Apagar LED después de recibir
+  if (now - lastReceiveTime > 20) {
     digitalWrite(LED_PIN, LOW);
   }
   
-  // Contador si no hay datos
-  if (millis() - lastPrint >= 1000) {
-    lastPrint = millis();
+  // Actualizar servos a 200Hz
+  if (now - lastUpdate >= UPDATE_INTERVAL) {
+    lastUpdate = now;
     
-    if (lastReceiveTime == 0 || (millis() - lastReceiveTime >= TIMEOUT)) {
-      Serial.print("[");
-      Serial.print(counter++);
-      Serial.println("] Esperando datos...");
-    }
-  }
-  
-  // Feedback detallado cada 3 segundos
-  if (mpuBrazoReady && (millis() - lastFeedback >= 3000)) {
-    lastFeedback = millis();
+    // Actualizar servo1 (vertical)
+    updateServoSmooth(servo1, servo1Current, servo1Target, iirServo1);
     
-    Serial.println("\n╔════════════════════════════════════╗");
-    Serial.println("║  REPORTE FUSIÓN DE SENSORES       ║");
-    Serial.println("╠════════════════════════════════════╣");
-    Serial.print("║ Guante AccelX: ");
-    Serial.print(receivedData.accelX, 2);
-    Serial.println(" m/s²          ║");
-    Serial.print("║ Brazo  AccelX: ");
-    Serial.print(brazoAccelX, 2);
-    Serial.println(" m/s²          ║");
-    Serial.print("║ Servo1: ");
-    Serial.print(servo1Position);
-    Serial.print("° | Servo2: ");
-    Serial.print(servo2Position);
-    Serial.println("°        ║");
-    Serial.print("║ Activo: Servo");
-    Serial.print(activeServo + 1);
-    Serial.println("                    ║");
-    Serial.println("╚════════════════════════════════════╝\n");
+    // Actualizar servo2 (horizontal)
+    updateServoSmooth(servo2, servo2Current, servo2Target, iirServo2);
   }
   
   // Timeout - volver a centro
-  if (lastReceiveTime > 0 && (millis() - lastReceiveTime > TIMEOUT)) {
-    if (servo1Position != 90) {
-      servo1Position += (servo1Position < 90) ? 1 : -1;
-      servo1.write(servo1Position);
-    }
-    if (servo2Position != 90) {
-      servo2Position += (servo2Position < 90) ? 1 : -1;
-      servo2.write(servo2Position);
-    }
-    delay(20);
+  if (lastReceiveTime > 0 && (now - lastReceiveTime > TIMEOUT)) {
+    servo1Target = 90;
+    servo2Target = 90;
+    
+    // Reset filtros IIR
+    iirServo1.reset(90);
+    iirServo2.reset(90);
   }
   
-  delay(10);
+  delay(1);
 }

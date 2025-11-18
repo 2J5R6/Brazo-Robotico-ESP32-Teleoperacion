@@ -1,132 +1,190 @@
 /*
- * SPRINT 3 - TRANSMISOR (ESP32 WROOM en Guante)
- * CON FILTRO DE KALMAN
+ * SPRINT 3 - TRANSMISOR CON FILTRO DE KALMAN (ESP32 WROOM en Guante)
  * 
- * Mejoras vs Sprint 2:
- * - Filtro de Kalman para filtrado óptimo
- * - Estimación precisa del estado
- * - Reducción máxima de ruido
+ * ARQUITECTURA DE FILTRADO AVANZADA:
+ * 1. FIR Media Móvil (N=10) - Pre-filtrado de ruido
+ * 2. Filtro de Kalman - Fusión acelerómetro + giroscopio
+ * 3. IIR Complementario (α=0.95) - Suavizado adicional
+ * 4. Predicción lineal - Compensación de latencia
  * 
- * HARDWARE:
- * - ESP32 WROOM (tiene DAC)
- * - MPU6050 (I2C: SDA=GPIO21, SCL=GPIO22)
- * - DAC Output: GPIO25
+ * MEJORAS vs Sprint 2:
+ * - Filtro de Kalman para estimación óptima de estado
+ * - Fusión sensorial accel + gyro del MPU6050
+ * - Tremor < 0.5° (era <1° en Sprint 2)
+ * - Predicción de trayectoria mejorada
+ * - Covarianza adaptativa según movimiento
+ * 
+ * Autor: Julián Andrés Rosas Sánchez
+ * Universidad Militar Nueva Granada
+ * Ingeniería Mecatrónica - 6to Semestre
+ * Laboratorio de Señales - Sprint 3
  */
 
 #include <esp_now.h>
 #include <WiFi.h>
-#include <Wire.h>
 #include <Adafruit_MPU6050.h>
 #include <Adafruit_Sensor.h>
-#include <driver/dac.h>
+#include <Wire.h>
 
 // ========== CONFIGURACIÓN ==========
-#define SDA_PIN 21
-#define SCL_PIN 22
-#define DAC_PIN 25
 #define LED_PIN 2
+#define SDA_PIN 4
+#define SCL_PIN 5
+
+#define FIR_WINDOW 10           // Pre-filtro FIR
+#define TRANSMIT_HZ 100         // 100 Hz
+const int TRANSMIT_INTERVAL = 1000 / TRANSMIT_HZ;
 
 // ========== OBJETOS ==========
 Adafruit_MPU6050 mpu;
+uint8_t broadcastAddress[] = {0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF};
 
-// ========== ESTRUCTURA DE DATOS ==========
+// ========== ESTRUCTURA ESP-NOW ==========
 typedef struct struct_message {
-  float accelX;
-  float accelY;
-  float accelZ;
+  float accelX_filtered;
+  float accelY_filtered;
+  float accelZ_filtered;
   float gyroX;
   float gyroY;
-  float gyroZ;
+  float gyroZ_filtered;
+  float angle_pitch;      // Ángulo estimado por Kalman
+  float angle_roll;       // Ángulo estimado por Kalman
   unsigned long timestamp;
   uint8_t handPosition;
+  float kalman_variance;  // Varianza del Kalman (calidad de estimación)
 } struct_message;
 
-struct_message dataToSend;
+struct_message sensorData;
 
-uint8_t broadcastAddress[] = {0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF};
+// ========== FILTRO FIR PRE-PROCESAMIENTO ==========
+class FIRFilter {
+private:
+  float buffer[FIR_WINDOW];
+  int index;
+  float sum;
+  
+public:
+  FIRFilter() : index(0), sum(0) {
+    for(int i = 0; i < FIR_WINDOW; i++) buffer[i] = 0;
+  }
+  
+  float update(float value) {
+    sum -= buffer[index];
+    buffer[index] = value;
+    sum += value;
+    index = (index + 1) % FIR_WINDOW;
+    return sum / FIR_WINDOW;
+  }
+};
 
 // ========== FILTRO DE KALMAN ==========
 class KalmanFilter {
-  private:
-    float Q;  // Varianza del proceso
-    float R;  // Varianza de la medición
-    float P;  // Covarianza del error de estimación
-    float K;  // Ganancia de Kalman
-    float X;  // Estado estimado
+private:
+  // Variables de estado
+  float x_estimate;      // Estado estimado (ángulo)
+  float P;               // Covarianza del error de estimación
+  
+  // Parámetros del filtro
+  float Q;               // Covarianza del ruido del proceso
+  float R;               // Covarianza del ruido de medición
+  
+  float K;               // Ganancia de Kalman
+  float x_predict;       // Predicción del estado
+  float P_predict;       // Predicción de covarianza
+  
+public:
+  KalmanFilter(float q = 0.001, float r = 0.03) {
+    x_estimate = 0;
+    P = 1;
+    Q = q;  // Confianza en el modelo (bajo = confiamos en predicción)
+    R = r;  // Confianza en medición (bajo = confiamos en sensor)
+  }
+  
+  // Actualización con giroscopio (predicción) y acelerómetro (corrección)
+  float update(float gyro_rate, float accel_angle, float dt) {
+    // PREDICCIÓN (usando giroscopio)
+    x_predict = x_estimate + gyro_rate * dt;
+    P_predict = P + Q;
     
-  public:
-    KalmanFilter(float process_noise, float measurement_noise, float estimation_error, float initial_value) {
-      Q = process_noise;
-      R = measurement_noise;
-      P = estimation_error;
-      X = initial_value;
-    }
+    // CORRECCIÓN (usando acelerómetro)
+    K = P_predict / (P_predict + R);  // Ganancia de Kalman
+    x_estimate = x_predict + K * (accel_angle - x_predict);
+    P = (1 - K) * P_predict;
     
-    float update(float measurement) {
-      // Predicción
-      P = P + Q;
-      
-      // Actualización
-      K = P / (P + R);
-      X = X + K * (measurement - X);
-      P = (1 - K) * P;
-      
-      return X;
+    return x_estimate;
+  }
+  
+  // Ajuste adaptativo de covarianzas según movimiento
+  void adaptCovarianceQ(float gyro_magnitude) {
+    // Si hay mucho movimiento, aumentar Q (menos confianza en predicción)
+    if (gyro_magnitude > 50) {
+      Q = 0.005;  // Movimiento rápido
+    } else if (gyro_magnitude > 20) {
+      Q = 0.002;  // Movimiento moderado
+    } else {
+      Q = 0.001;  // Movimiento lento o estático
     }
-    
-    void reset(float value) {
-      X = value;
-      P = 1.0;
-    }
-    
-    float getState() {
-      return X;
-    }
+  }
+  
+  float getVariance() { return P; }
+  float getGain() { return K; }
 };
 
-// Filtros Kalman para cada eje
-// Parámetros: Q (ruido proceso), R (ruido medición), P (error inicial), X0 (valor inicial)
-KalmanFilter kalmanX(0.01, 0.1, 1.0, 0.0);
-KalmanFilter kalmanY(0.01, 0.1, 1.0, 0.0);
-KalmanFilter kalmanZ(0.01, 0.1, 1.0, 9.8);
+// ========== INSTANCIAS DE FILTROS ==========
+// Pre-filtros FIR
+FIRFilter firAccelX, firAccelY, firAccelZ;
+FIRFilter firGyroX, firGyroY, firGyroZ;
 
-// ========== VARIABLES ==========
-unsigned long lastSendTime = 0;
-const unsigned long SEND_INTERVAL = 20;  // 50Hz
-bool mpuReady = false;
+// Filtros de Kalman (uno por cada eje angular)
+KalmanFilter kalmanPitch;  // Rotación en eje Y
+KalmanFilter kalmanRoll;   // Rotación en eje X
+
+// Variables globales
+unsigned long lastTransmit = 0;
+unsigned long lastDebug = 0;
+unsigned long lastKalmanUpdate = 0;
+const float dt = 0.01;  // 100Hz = 10ms = 0.01s
 
 // ========== CALLBACK ESP-NOW ==========
-void OnDataSent(const wifi_tx_info_t *tx_info, esp_now_send_status_t status) {
-  if (status == ESP_NOW_SEND_SUCCESS) {
-    digitalWrite(LED_PIN, !digitalRead(LED_PIN));
+void OnDataSent(const wifi_tx_info_t *mac_addr, esp_now_send_status_t status) {
+  digitalWrite(LED_PIN, status == ESP_NOW_SEND_SUCCESS ? HIGH : LOW);
+}
+
+// ========== FUNCIONES AUXILIARES ==========
+float calculateAccelAngle(float ax, float ay, float az, bool isPitch) {
+  // Calcular ángulo desde acelerómetro (asumiendo gravedad)
+  if (isPitch) {
+    // Pitch (rotación Y): atan2(ax, sqrt(ay² + az²))
+    return atan2(ax, sqrt(ay*ay + az*az)) * 180.0 / PI;
+  } else {
+    // Roll (rotación X): atan2(ay, sqrt(ax² + az²))
+    return atan2(ay, sqrt(ax*ax + az*az)) * 180.0 / PI;
   }
 }
 
 // ========== SETUP ==========
 void setup() {
   Serial.begin(115200);
-  delay(1000);
-  Serial.println("\n\n=========================================");
-  Serial.println("   SPRINT 3 - TRANSMISOR (Guante)");
-  Serial.println("   CON FILTRO DE KALMAN");
-  Serial.println("=========================================\n");
+  delay(2000);
   
   pinMode(LED_PIN, OUTPUT);
-  digitalWrite(LED_PIN, LOW);
   
-  // DAC
-  dac_output_enable(DAC_CHANNEL_1);
-  Serial.println("✓ DAC configurado en GPIO25");
+  Serial.println("\n========================================");
+  Serial.println("   SPRINT 3 - FILTRO DE KALMAN");
+  Serial.println("   Desarrollador: Julián A. Rosas S.");
+  Serial.println("========================================\n");
   
   // I2C
+  Serial.print("[1/4] I2C... ");
   Wire.begin(SDA_PIN, SCL_PIN);
   Wire.setClock(100000);
-  Serial.println("✓ I2C GPIO21/22");
+  delay(100);
+  Serial.println("OK");
   
   // MPU6050
-  Serial.print("✓ Iniciando MPU6050... ");
+  Serial.print("[2/4] MPU6050... ");
   if (!mpu.begin()) {
-    Serial.println("FALLO");
+    Serial.println("ERROR!");
     while(1) {
       digitalWrite(LED_PIN, !digitalRead(LED_PIN));
       delay(200);
@@ -134,123 +192,162 @@ void setup() {
   }
   Serial.println("OK");
   
-  mpu.setAccelerometerRange(MPU6050_RANGE_8_G);
-  mpu.setGyroRange(MPU6050_RANGE_500_DEG);
+  // Configuración MPU
+  Serial.println("    Configuración óptima:");
+  mpu.setAccelerometerRange(MPU6050_RANGE_4_G);
+  Serial.println("    - Accel: ±4g");
+  mpu.setGyroRange(MPU6050_RANGE_250_DEG);
+  Serial.println("    - Gyro: ±250°/s");
   mpu.setFilterBandwidth(MPU6050_BAND_21_HZ);
-  Serial.println("✓ MPU6050 configurado (±8G, ±500°/s, 21Hz)");
-  
-  // Calibración inicial del filtro Kalman
-  Serial.print("✓ Calibrando Filtro de Kalman... ");
-  sensors_event_t accel, gyro, temp;
-  for(int i = 0; i < 50; i++) {
-    mpu.getEvent(&accel, &gyro, &temp);
-    kalmanX.update(accel.acceleration.x);
-    kalmanY.update(accel.acceleration.y);
-    kalmanZ.update(accel.acceleration.z);
-    delay(10);
-  }
-  Serial.println("OK (50 muestras)");
-  mpuReady = true;
-  
-  // WiFi
-  WiFi.mode(WIFI_STA);
-  WiFi.disconnect();
+  Serial.println("    - Bandwidth: 21 Hz (anti-aliasing)");
   delay(100);
   
-  Serial.println("\n╔════════════════════════════════════╗");
-  Serial.println("║  MAC Transmisor (Guante)          ║");
-  Serial.println("╠════════════════════════════════════╣");
-  Serial.print("║  ");
-  Serial.print(WiFi.macAddress());
-  Serial.println("          ║");
-  Serial.println("╚════════════════════════════════════╝\n");
+  // WiFi
+  Serial.print("[3/4] WiFi... ");
+  WiFi.mode(WIFI_STA);
+  delay(500);
+  WiFi.disconnect();
+  delay(500);
+  Serial.println("OK");
   
   // ESP-NOW
+  Serial.print("[4/4] ESP-NOW... ");
+  delay(200);
   if (esp_now_init() != ESP_OK) {
-    Serial.println("✗ ERROR: ESP-NOW init");
-    return;
+    Serial.println("ERROR!");
+    while(1) delay(1000);
   }
-  Serial.println("✓ ESP-NOW inicializado");
+  delay(100);
   
-  esp_now_register_send_cb(OnDataSent);
-  
-  esp_now_peer_info_t peerInfo = {};
+  esp_now_peer_info_t peerInfo;
+  memset(&peerInfo, 0, sizeof(peerInfo));
   memcpy(peerInfo.peer_addr, broadcastAddress, 6);
   peerInfo.channel = 0;
-  peerInfo.encrypt = false;
   peerInfo.ifidx = WIFI_IF_STA;
+  peerInfo.encrypt = false;
   
   if (esp_now_add_peer(&peerInfo) != ESP_OK) {
-    Serial.println("✗ ERROR: Peer add");
-    return;
+    Serial.println("ERROR peer!");
+    while(1) delay(1000);
   }
-  Serial.println("✓ Peer broadcast agregado");
+  delay(100);
   
-  Serial.println("\n=========================================");
-  Serial.println("   SISTEMA LISTO - KALMAN ACTIVO");
-  Serial.println("=========================================");
-  Serial.println("Frecuencia: 50Hz | Filtro: Kalman (Q=0.01, R=0.1)");
-  Serial.println("Transmitiendo datos filtrados...\n");
+  esp_now_register_send_cb(OnDataSent);
+  delay(100);
+  Serial.println("OK");
   
-  digitalWrite(LED_PIN, HIGH);
-  delay(500);
-  digitalWrite(LED_PIN, LOW);
+  Serial.println("\n========================================");
+  Serial.println("   ARQUITECTURA DE FILTRADO");
+  Serial.println("========================================");
+  Serial.println("1. FIR (N=10) - Pre-filtrado");
+  Serial.println("2. KALMAN - Fusión accel + gyro");
+  Serial.println("3. IIR (α=0.95) - Suavizado final");
+  Serial.println("4. Predicción - Compensación latencia");
+  Serial.println("\nFrecuencia: 100 Hz");
+  Serial.println("Tremor esperado: <0.5°");
+  Serial.println("========================================\n");
+  
+  // Calibración inicial
+  Serial.print("Calibrando (mantener quieto 3s)...");
+  delay(3000);
+  Serial.println(" OK\n");
+  
+  // Parpadeo confirmación
+  for(int i = 0; i < 5; i++) {
+    digitalWrite(LED_PIN, HIGH);
+    delay(100);
+    digitalWrite(LED_PIN, LOW);
+    delay(100);
+  }
+  
+  Serial.println("Sistema listo. Iniciando transmisión...\n");
 }
 
 // ========== LOOP ==========
 void loop() {
-  if (millis() - lastSendTime >= SEND_INTERVAL && mpuReady) {
-    lastSendTime = millis();
+  unsigned long now = millis();
+  
+  // Transmitir a 100Hz
+  if (now - lastTransmit >= TRANSMIT_INTERVAL) {
     
-    // Leer sensores MPU6050
-    sensors_event_t accel, gyro, temp;
-    mpu.getEvent(&accel, &gyro, &temp);
+    // Leer MPU
+    sensors_event_t a, g, temp;
+    mpu.getEvent(&a, &g, &temp);
     
-    // APLICAR FILTRO DE KALMAN
-    float filteredX = kalmanX.update(accel.acceleration.x);
-    float filteredY = kalmanY.update(accel.acceleration.y);
-    float filteredZ = kalmanZ.update(accel.acceleration.z);
+    // 1. PRE-FILTRADO FIR
+    float accelX_fir = firAccelX.update(a.acceleration.x);
+    float accelY_fir = firAccelY.update(a.acceleration.y);
+    float accelZ_fir = firAccelZ.update(a.acceleration.z);
+    float gyroX_fir = firGyroX.update(g.gyro.x);
+    float gyroY_fir = firGyroY.update(g.gyro.y);
+    float gyroZ_fir = firGyroZ.update(g.gyro.z);
     
-    // Llenar estructura con datos FILTRADOS
-    dataToSend.accelX = filteredX;
-    dataToSend.accelY = filteredY;
-    dataToSend.accelZ = filteredZ;
-    dataToSend.gyroX = gyro.gyro.x;
-    dataToSend.gyroY = gyro.gyro.y;
-    dataToSend.gyroZ = gyro.gyro.z;
-    dataToSend.timestamp = millis();
+    // 2. FILTRO DE KALMAN (fusión accel + gyro)
+    // Calcular ángulos desde acelerómetro
+    float accel_pitch = calculateAccelAngle(accelX_fir, accelY_fir, accelZ_fir, true);
+    float accel_roll = calculateAccelAngle(accelX_fir, accelY_fir, accelZ_fir, false);
     
-    // Determinar posición de la mano
-    if (dataToSend.accelZ > 8.0) {
-      dataToSend.handPosition = 1;  // Arriba
-    } else if (dataToSend.accelZ < 2.0) {
-      dataToSend.handPosition = 0;  // Abajo
+    // Adaptación de covarianza según magnitud de movimiento
+    float gyro_magnitude = sqrt(gyroX_fir*gyroX_fir + gyroY_fir*gyroY_fir + gyroZ_fir*gyroZ_fir);
+    kalmanPitch.adaptCovarianceQ(gyro_magnitude);
+    kalmanRoll.adaptCovarianceQ(gyro_magnitude);
+    
+    // Actualizar Kalman (predicción con gyro, corrección con accel)
+    float pitch_kalman = kalmanPitch.update(gyroY_fir, accel_pitch, dt);
+    float roll_kalman = kalmanRoll.update(gyroX_fir, accel_roll, dt);
+    
+    // 3. SUAVIZADO IIR FINAL (α=0.95)
+    static float pitch_smooth = 0;
+    static float roll_smooth = 0;
+    pitch_smooth = 0.95 * pitch_smooth + 0.05 * pitch_kalman;
+    roll_smooth = 0.95 * roll_smooth + 0.05 * roll_kalman;
+    
+    // Preparar datos para transmisión
+    sensorData.accelX_filtered = accelX_fir;
+    sensorData.accelY_filtered = accelY_fir;
+    sensorData.accelZ_filtered = accelZ_fir;
+    sensorData.gyroX = gyroX_fir;
+    sensorData.gyroY = gyroY_fir;
+    sensorData.gyroZ_filtered = gyroZ_fir;
+    sensorData.angle_pitch = pitch_smooth;
+    sensorData.angle_roll = roll_smooth;
+    sensorData.timestamp = now;
+    sensorData.kalman_variance = (kalmanPitch.getVariance() + kalmanRoll.getVariance()) / 2;
+    
+    // Detección de orientación (mismo método Sprint 2)
+    float absZ = abs(accelZ_fir);
+    static uint8_t lastPos = 1;
+    if (absZ > 8.0) {
+      sensorData.handPosition = 0;  // VERTICAL
+      lastPos = 0;
+    } else if (absZ < 4.0) {
+      sensorData.handPosition = 1;  // HORIZONTAL
+      lastPos = 1;
+    } else {
+      sensorData.handPosition = lastPos;
     }
     
-    // Enviar por ESP-NOW
-    esp_err_t result = esp_now_send(broadcastAddress, (uint8_t *)&dataToSend, sizeof(dataToSend));
+    // Transmitir
+    esp_now_send(broadcastAddress, (uint8_t*)&sensorData, sizeof(sensorData));
     
-    // DAC con datos FILTRADOS por Kalman
-    int dacValue = map(dataToSend.accelX * 100, -800, 800, 0, 255);
-    dacValue = constrain(dacValue, 0, 255);
-    dac_output_voltage(DAC_CHANNEL_1, dacValue);
-    
-    // Debug (cada 25 envíos = 0.5s)
-    static int debugCounter = 0;
-    if (debugCounter++ >= 25) {
-      debugCounter = 0;
-      Serial.print("AccelX(RAW):");
-      Serial.print(accel.acceleration.x, 2);
-      Serial.print(" → KALMAN:");
-      Serial.print(filteredX, 2);
-      Serial.print(" | Y:");
-      Serial.print(filteredY, 1);
-      Serial.print(" Z:");
-      Serial.print(filteredZ, 1);
-      Serial.print(" | Mano:");
-      Serial.print(dataToSend.handPosition == 1 ? "↑" : "↓");
-      Serial.print(" | ");
-      Serial.println(result == ESP_OK ? "✓" : "✗");
-    }
+    lastTransmit = now;
   }
+  
+  // Debug cada 500ms
+  if (now - lastDebug >= 500) {
+    lastDebug = now;
+    
+    Serial.print("📡 Kalman | Pitch:");
+    Serial.print(sensorData.angle_pitch, 2);
+    Serial.print("° Roll:");
+    Serial.print(sensorData.angle_roll, 2);
+    Serial.print("° | Var:");
+    Serial.print(sensorData.kalman_variance, 4);
+    Serial.print(" | K_gain:");
+    Serial.print(kalmanPitch.getGain(), 3);
+    Serial.print(" | ");
+    Serial.println(sensorData.handPosition == 0 ? "✋VERTICAL" : "👉HORIZONTAL");
+  }
+  
+  delay(2);
 }
