@@ -635,16 +635,13 @@ Cada sprint sigue esta estructura:
 ---
 
 ## 📞 Información de Contacto
+[text](https://www.linkedin.com/in/envision-juli%C3%A1n-andr%C3%A9s-rosas-s%C3%A1nchez-creating/)
 
 ### Equipo de Trabajo
-- Integrante 1: _______________
-- Integrante 2: _______________
-- Integrante 3: _______________
+- Julian Andres Rosas Sanchez
 
-### Instructor
 - Laboratorio de Señales
 - Universidad Militar Nueva Granada
-- Semestre VI - 2025
 
 ---
 
